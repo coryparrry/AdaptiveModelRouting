@@ -1,8 +1,7 @@
 import Foundation
 import FoundationModels
 import XCTest
-import AdaptiveModelRouting
-@testable import AdaptiveFoundationModels
+@testable import AdaptiveModelRouting
 
 /// Verifies the Apple adapter without invoking model services, consuming quota or requiring an entitlement.
 @available(iOS 27.0, macOS 27.0, *)

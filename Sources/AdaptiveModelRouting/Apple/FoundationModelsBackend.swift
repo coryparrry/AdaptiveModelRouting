@@ -1,6 +1,5 @@
 import Foundation
 import FoundationModels
-import AdaptiveModelRouting
 
 /// Isolates SDK operations so adapter policy tests never require model downloads, entitlement or quota.
 @available(iOS 27.0, macOS 27.0, *)

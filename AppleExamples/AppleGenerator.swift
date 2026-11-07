@@ -1,5 +1,4 @@
 import FoundationModels
-import AdaptiveFoundationModels
 import AdaptiveModelRouting
 
 /// Demonstrates app-owned structured output without manually wiring two generation closures.

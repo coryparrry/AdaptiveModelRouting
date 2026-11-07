@@ -2,9 +2,9 @@
 
 A Swift package that learns when to use an on-device model or a preferred cloud model such as Private Cloud Compute.
 
-It starts cloud-first, learns from real request timings on the current device and connection, and chooses local inference when it has a meaningful speed advantage. The app supplies both inference closures; prompts, model SDKs and output types stay in the app.
+It starts cloud-first, learns from real request timings on the current device and connection, and chooses local inference when it has a meaningful speed advantage. One product and one import provide the Apple adapter, routing presets and detailed results. Apps can also supply their own inference closures.
 
-The core requires **Swift 6.2**, **iOS 26+** or **macOS 26+** and uses Foundation and Network. The optional **AdaptiveFoundationModels** product requires an **iOS/macOS 27 SDK and runtime** and uses Apple's Foundation Models and CryptoKit. The package has no third-party dependencies. Building all products and tests requires the newer SDK; validation currently uses Xcode 27.3.
+Build with an **iOS/macOS 27 SDK**; validation currently uses Xcode 27.3. Core routing APIs support **iOS 26+** and **macOS 26+**. The Apple adapter requires an **iOS/macOS 27 runtime**. The package uses Apple's Foundation, Network, Foundation Models and CryptoKit frameworks, with no third-party dependencies.
 
 ## Add the package
 
@@ -14,14 +14,14 @@ This is a private repository. Consumers need read access through their authentic
 .package(url: "https://github.com/coryparrry/AdaptiveModelRouting.git", branch: "main")
 ```
 
-Add `.product(name: "AdaptiveFoundationModels", package: "AdaptiveModelRouting")` for the Apple adapter, or `.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")` for the core alone. Use a tagged version or commit revision for reproducible production builds once the desired changes are available.
+Add `.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")` to your target. Everything is available through `import AdaptiveModelRouting`. Use a tagged version or commit revision for reproducible production builds once the desired changes are available.
 
 ## Use Apple Foundation Models
 
 On iOS/macOS 27+, keep one adapter alive for each stable workload:
 
 ```swift
-import AdaptiveFoundationModels
+import AdaptiveModelRouting
 
 // In an @MainActor app model:
 let router = FoundationModelsRouter(
@@ -61,7 +61,7 @@ let configuration = RoutingConfiguration(
 )
 ```
 
-Import `AdaptiveModelRouting` when naming core types explicitly. Configuration also exposes sample count, prediction sample limit, size tolerance, sample lifetime, local refresh interval, variability allowance and slow-cloud threshold. Invalid configuration is rejected at initialization.
+Configuration also exposes sample count, prediction sample limit, size tolerance, sample lifetime, local refresh interval, variability allowance and slow-cloud threshold. Invalid configuration is rejected at initialization.
 
 ## Explain a result
 
@@ -160,9 +160,10 @@ The app controls what its inference closures send to a cloud provider. Use one o
 swift test
 swift test -c release
 swift build -c release
+swift build --package-path Tests/SingleImportConsumer
 ```
 
-Tests use injected timings, provider closures and Apple backend operations, require no cloud entitlement, and make no model requests. They cover bootstrap, presets, diagnostics, device/connection differences, recovery, persistence, cancellation, legacy API use, native error classification and Generable decoding. Both examples compile. Actual tokenization, generation quality, signed PCC access and live network handoff still require qualification in a consuming app.
+Tests use injected timings, provider closures and Apple backend operations, require no cloud entitlement, and make no model requests. They cover bootstrap, presets, diagnostics, device/connection differences, recovery, persistence, cancellation, legacy API use, native error classification and Generable decoding. Both examples compile. The separate consumer fixture verifies that the Apple adapter, explicit configuration and detailed results work with one product and one import. Actual tokenization, generation quality, signed PCC access and live network handoff still require qualification in a consuming app.
 
 ## License
 

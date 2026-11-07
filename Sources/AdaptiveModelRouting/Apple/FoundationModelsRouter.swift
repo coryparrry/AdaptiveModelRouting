@@ -1,6 +1,5 @@
 import Foundation
 import FoundationModels
-import AdaptiveModelRouting
 import CryptoKit
 
 /// App-facing failures when no permitted result exists or the output budget is invalid.
