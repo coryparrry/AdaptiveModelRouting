@@ -31,6 +31,7 @@ def run_step(name: str, command: list[str], artifacts: Path, environment: dict, 
     """Save full output while reporting one completion line and bounded failure details."""
     started = time.monotonic()
     log = artifacts / f"{name}.log"
+    print(f"{name}: running (log: {log.name})", flush=True)
     with log.open("w") as output:
         process = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=output,
                                    stderr=subprocess.STDOUT, start_new_session=True)
@@ -67,6 +68,7 @@ def main() -> None:
     environment = os.environ.copy()
     environment["CLANG_MODULE_CACHE_PATH"] = str(artifacts / "clang-cache")
     environment["SWIFTPM_MODULECACHE_OVERRIDE"] = str(artifacts / "swift-cache")
+    environment["NSUnbufferedIO"] = "YES"
     cache = ["--cache-path", str(artifacts / "spm-cache"), "--disable-sandbox"]
     results = []
     sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
@@ -76,7 +78,7 @@ def main() -> None:
     run_step("script-tests", [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests"], artifacts, environment, results)
     configurations = ["debug", "release"] if args.configuration == "all" else [args.configuration]
     for configuration in configurations:
-        run_step(f"tests-{configuration}", ["swift", "test", "-c", configuration, *cache], artifacts, environment, results)
+        run_step(f"tests-{configuration}", ["swift", "test", "-c", configuration, *cache], artifacts, environment, results, timeout=180)
     run_step("release-build", ["swift", "build", "-c", "release", *cache], artifacts, environment, results)
     run_step("single-import-consumer", ["swift", "build", "--package-path", "Tests/SingleImportConsumer",
              "--scratch-path", str(artifacts / "consumer-build"), *cache], artifacts, environment, results)

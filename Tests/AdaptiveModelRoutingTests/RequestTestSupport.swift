@@ -1,4 +1,5 @@
 import Foundation
+import XCTest
 
 /// Coordinates asynchronous tests without polling or blocking the main actor.
 @MainActor
@@ -6,9 +7,17 @@ final class RoutingTestSignal {
     private var signalled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    /// Suspends until signalled, including when the signal arrived before registration.
-    func wait() async {
+    /// Suspends until signalled, failing with the caller's location instead of hanging an entire CI stage.
+    func wait(timeout: Duration = .seconds(5), file: StaticString = #filePath, line: UInt = #line) async {
         if signalled { return }
+        let timer = Task {
+            do { try await Task.sleep(for: timeout) }
+            catch { return }
+            guard !signalled else { return }
+            XCTFail("Expected asynchronous signal did not arrive before the test timeout.", file: file, line: line)
+            signal()
+        }
+        defer { timer.cancel() }
         await withCheckedContinuation { waiters.append($0) }
     }
 
