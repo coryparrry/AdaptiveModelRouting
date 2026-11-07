@@ -73,6 +73,16 @@ class RunnerTests(unittest.TestCase):
             summary = json.loads((root / "summary.json").read_text())
             self.assertEqual([step["exitCode"] for step in summary], [0, 3])
 
+    def test_early_failure_survives_long_success_tail(self):
+        """Hosted logs retain attributed failures even when later passing tests push them out of the tail."""
+        lines = ["Example.swift:42: error: missing asynchronous signal"] + [f"passed case {i}" for i in range(100)]
+        excerpt = validate.failure_excerpt(lines)
+        self.assertIn(lines[0], excerpt)
+        self.assertIn(lines[-1], excerpt)
+        self.assertLessEqual(len(excerpt.splitlines()), 55)
+        many_errors = validate.failure_excerpt([f"error: case {i}" for i in range(100)])
+        self.assertEqual(len(many_errors.splitlines()), 55)
+
     def test_timeout_is_bounded(self):
         """A stalled validation step is terminated and attributed as timeout rather than hanging the pipeline."""
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):

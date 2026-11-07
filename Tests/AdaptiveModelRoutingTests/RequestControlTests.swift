@@ -64,14 +64,14 @@ final class RequestControlTests: XCTestCase {
 
     /// A deadline returns before a noncooperative provider completes and prevents late health/training updates.
     func testDeadlineReturnsBeforeProviderAndSuppressesLateResult() async throws {
-        let router = router(configuration: .init(slowCloudAfter: .milliseconds(30)))
+        let router = router(configuration: .init(slowCloudAfter: .milliseconds(400)))
         let provider = ControlledRoutingProvider()
         var events: [RoutingAttempt] = []
-        let safety = Task { try? await Task.sleep(for: .seconds(1)); provider.release() }
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
         defer { safety.cancel(); provider.release() }
         let request = Task {
             try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
-                deadline: .after(.milliseconds(10)), shouldFallback: { _, _ in true }, onAttempt: { events.append($0) },
+                deadline: .after(.milliseconds(200)), shouldFallback: { _, _ in true }, onAttempt: { events.append($0) },
                 cloud: { await provider.call() }, onDevice: { XCTFail("Deadlines must not trigger recovery."); return "local" })
         }
         await provider.started.wait()
@@ -79,7 +79,7 @@ final class RequestControlTests: XCTestCase {
         catch RoutingRequestError.deadlineExceeded {}
         XCTAssertFalse(provider.released, "Returning must not wait for ignored cancellation.")
         XCTAssertEqual(events.map(\.outcome), [.timedOut])
-        try await Task.sleep(for: .milliseconds(50))
+        try await Task.sleep(for: .milliseconds(450))
         XCTAssertTrue(router.profile.failures.isEmpty, "The abandoned slow watch must be cancelled.")
         provider.release()
         await provider.finished.wait()
@@ -93,16 +93,18 @@ final class RequestControlTests: XCTestCase {
         let router = router()
         let provider = ControlledRoutingProvider()
         var events: [RoutingAttempt] = []
-        let safety = Task { try? await Task.sleep(for: .seconds(1)); provider.release() }
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
         defer { safety.cancel(); provider.release() }
+        let started = ContinuousClock.now
         do {
             let _: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
-                deadline: .after(.milliseconds(40)), onAttempt: { events.append($0) }, cloud: {
-                    try await Task.sleep(for: .milliseconds(10))
+                deadline: .after(.seconds(1)), onAttempt: { events.append($0) }, cloud: {
+                    try await Task.sleep(for: .milliseconds(600))
                     throw URLError(.timedOut)
                 }, onDevice: { await provider.call() })
             XCTFail("The shared deadline must stop fallback too.")
         } catch RoutingRequestError.deadlineExceeded {}
+        XCTAssertLessThan(started.duration(to: .now), .milliseconds(1_400), "Fallback must use the remaining deadline, not start a new one.")
         XCTAssertFalse(provider.released)
         XCTAssertEqual(events.map(\.route), [.cloud, .onDevice])
         XCTAssertEqual(events.map(\.outcome), [.failed, .timedOut])
@@ -115,7 +117,7 @@ final class RequestControlTests: XCTestCase {
         let router = router()
         let provider = ControlledRoutingProvider()
         var events: [RoutingAttempt] = []
-        let safety = Task { try? await Task.sleep(for: .seconds(1)); provider.release() }
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
         defer { safety.cancel(); provider.release() }
         let request = Task {
             try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192, deadline: .unlimited,

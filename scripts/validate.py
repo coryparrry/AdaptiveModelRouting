@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -25,6 +26,14 @@ def stop_process(process: subprocess.Popen) -> None:
         process.wait()
     except ProcessLookupError:
         process.wait()
+
+
+def failure_excerpt(lines: list[str]) -> str:
+    """Keep early attributed errors as well as the tail when artifact storage is unavailable."""
+    tail_start = max(0, len(lines) - 35)
+    failures = [line for line in lines[:tail_start]
+                if re.search(r"error:|\bfailed\b|\b[1-9]\d* failures?\b|exceeded", line, re.IGNORECASE)]
+    return "\n".join(failures[:20] + lines[tail_start:])
 
 
 def run_step(name: str, command: list[str], artifacts: Path, environment: dict, results: list, timeout: float = 600) -> None:
@@ -50,7 +59,7 @@ def run_step(name: str, command: list[str], artifacts: Path, environment: dict, 
     (artifacts / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"{name}: {'passed' if code == 0 else 'FAILED'} ({record['seconds']}s)", flush=True)
     if code:
-        print("\n".join(log.read_text(errors="replace").splitlines()[-35:]))
+        print(failure_excerpt(log.read_text(errors="replace").splitlines()))
         raise SystemExit(code)
 
 

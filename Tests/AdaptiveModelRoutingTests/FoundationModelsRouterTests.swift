@@ -262,11 +262,11 @@ final class FoundationModelsRouterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let provider = ControlledRoutingProvider()
         backend.tokenProvider = provider
-        let safety = Task { try? await Task.sleep(for: .seconds(1)); provider.release() }
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
         defer { safety.cancel(); provider.release() }
         var attempts: [RoutingAttempt] = []
         let task = Task {
-            try await router.respondDetailed(to: "Summary", deadline: .after(.milliseconds(20)), onAttempt: { attempts.append($0) })
+            try await router.respondDetailed(to: "Summary", deadline: .after(.milliseconds(200)), onAttempt: { attempts.append($0) })
         }
         await provider.started.wait()
         do { _ = try await task.value; XCTFail("Preflight must share the request deadline.") }
@@ -352,7 +352,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let provider = ControlledRoutingProvider()
         backend.tokenProvider = provider
-        let safety = Task { try? await Task.sleep(for: .seconds(1)); provider.release() }
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
         defer { safety.cancel(); provider.release() }
         let text = Task { try await router.respond(to: "Text request") }
         await provider.started.wait()
