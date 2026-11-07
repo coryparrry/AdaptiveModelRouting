@@ -153,7 +153,7 @@ final class AdaptiveRouterTests: XCTestCase {
             .profile.samples.count, 1)
         XCTAssertEqual(AdaptiveRouter(directory: directory, system: "new-os", monitorConnection: false)
             .profile.samples.count, 0)
-        XCTAssertTrue(try directory.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+        XCTAssertTrue(try hasBackupExclusion(at: directory))
     }
 
     /// Unavailable or failed requests cause backoff without making additional inference calls.

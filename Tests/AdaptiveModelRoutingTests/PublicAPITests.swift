@@ -144,7 +144,7 @@ final class PublicAPITests: XCTestCase {
         XCTAssertFalse(InferenceExecutor.fitsLocal(inputTokens: 7_793, localCapacity: 8_192))
     }
 
-    /// A local provider error retries cloud once with the same generic result type.
+    /// A temporary local provider error retries cloud once with the same generic result type.
     @MainActor
     func testExecutorRetriesFailedLocalWithoutRepeatingIt() async throws {
         var localCalls = 0
@@ -154,7 +154,7 @@ final class PublicAPITests: XCTestCase {
             return 42
         }, onDevice: {
             localCalls += 1
-            throw URLError(.unknown)
+            throw URLError(.resourceUnavailable)
         })
         XCTAssertEqual(output, 42)
         XCTAssertEqual(localCalls, 1)

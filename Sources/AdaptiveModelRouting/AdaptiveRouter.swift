@@ -71,25 +71,41 @@ public final class AdaptiveRouter {
     public func snapshot() -> Snapshot { Snapshot(connection: connection, generation: generation) }
 
     /// Chooses a lane using current device history and current network health.
-    public func choose(inputTokens: Int, localCapacity: Int, now: Date = .now) -> InferenceRoute {
-        profile.choose(inputTokens: inputTokens, localCapacity: localCapacity, connection: connection, now: now, configuration: configuration)
+    public func choose(
+        inputTokens: Int, localCapacity: Int, now: Date = .now,
+        policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init()
+    ) -> InferenceRoute {
+        profile.choose(inputTokens: inputTokens, localCapacity: localCapacity, connection: connection,
+            now: now, configuration: configuration, policy: policy, workload: workload)
     }
 
     /// Selects, measures and falls back between caller-supplied model operations without retaining their content.
+    /// Cloud requirements forbid local execution; the error classifier also governs health backoff.
     public func respond<Value>(
         inputTokens: Int, localContextCapacity: Int,
+        policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
+        shouldFallback: (InferenceRoute, any Error) -> Bool = { _, error in InferenceExecutor.isRetryable(error) },
         cloud: () async throws -> Value?,
         onDevice: () async throws -> Value
     ) async throws -> Value? {
         let snapshot = snapshot()
-        let preferred = choose(inputTokens: inputTokens, localCapacity: localContextCapacity)
+        let preferred = choose(inputTokens: inputTokens, localCapacity: localContextCapacity, policy: policy, workload: workload)
         let fits = InferenceExecutor.fitsLocal(inputTokens: inputTokens, localCapacity: localContextCapacity,
-            responseReserve: configuration.localResponseReserve)
-        return try await InferenceExecutor.respond(preferred: preferred, canUseLocalWhole: fits, cloud: {
+            responseReserve: max(configuration.localResponseReserve, workload.expectedOutputTokens ?? 0))
+        return try await InferenceExecutor.respond(preferred: preferred, canUseLocalWhole: fits, policy: policy,
+            shouldFallback: { model, error in
+                let retry = shouldFallback(model, error)
+                if retry && !Task.isCancelled && (model == .onDevice || snapshot.generation == self.generation) {
+                    self.profile.recordFailure(model: model, connection: snapshot.connection, now: .now)
+                    self.save()
+                }
+                return retry
+            }, cloud: {
             try await measure(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
-                available: { $0 != nil }, operation: cloud)
+                workload: workload, recordErrors: false, available: { $0 != nil }, operation: cloud)
         }, onDevice: {
-            try await measure(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot, operation: onDevice)
+            try await measure(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
+                workload: workload, recordErrors: false, operation: onDevice)
         })
     }
 
@@ -106,8 +122,21 @@ public final class AdaptiveRouter {
     }
 
     /// Measures only the request already selected; calibration never duplicates a meeting request.
+    /// Standalone measurement records thrown failures only for recognized temporary network errors.
     public func measure<Value>(
         model: InferenceRoute, inputTokens: Int, snapshot: Snapshot,
+        workload: RoutingWorkload = .init(),
+        available: (Value) -> Bool = { _ in true },
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        try await measure(model: model, inputTokens: inputTokens, snapshot: snapshot,
+            workload: workload, recordErrors: true, available: available, operation: operation)
+    }
+
+    /// Integrated execution classifies errors once in the executor; standalone measurement uses network defaults.
+    private func measure<Value>(
+        model: InferenceRoute, inputTokens: Int, snapshot: Snapshot,
+        workload: RoutingWorkload, recordErrors: Bool,
         available: (Value) -> Bool = { _ in true },
         operation: () async throws -> Value
     ) async throws -> Value {
@@ -129,7 +158,7 @@ public final class AdaptiveRouter {
             if model == .onDevice || snapshot.generation == generation {
                 if available(result) {
                     profile.record(model: model, tokens: inputTokens, seconds: seconds,
-                        connection: snapshot.connection, now: .now)
+                        connection: snapshot.connection, now: .now, workload: workload)
                 } else if model == .cloud {
                     profile.recordFailure(connection: snapshot.connection, now: .now)
                 }
@@ -140,7 +169,8 @@ public final class AdaptiveRouter {
             throw CancellationError()
         } catch {
             try Task.checkCancellation()
-            if model == .onDevice || snapshot.generation == generation {
+            if recordErrors && InferenceExecutor.isRetryable(error)
+                && (model == .onDevice || snapshot.generation == generation) {
                 profile.recordFailure(model: model, connection: snapshot.connection, now: .now)
                 save()
             }
