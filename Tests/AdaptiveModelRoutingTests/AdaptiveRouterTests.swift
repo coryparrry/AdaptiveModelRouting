@@ -133,7 +133,9 @@ final class AdaptiveRouterTests: XCTestCase {
             profile.record(model: .cloud, tokens: 2_000, seconds: 1, connection: wifi,
                 now: now.addingTimeInterval(Double(index)))
         }
-        XCTAssertEqual(profile.samples.count, 128)
+        XCTAssertEqual(profile.samples.filter { $0.model == .cloud }.count, 128)
+        XCTAssertEqual(profile.samples.filter { $0.model == .onDevice }.count, 3)
+        XCTAssertLessThanOrEqual(profile.samples.count, 256)
     }
 
     /// Stores only timing metadata and reloads it locally, resetting calibration on an OS update.

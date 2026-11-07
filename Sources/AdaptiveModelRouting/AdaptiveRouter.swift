@@ -79,34 +79,95 @@ public final class AdaptiveRouter {
             now: now, configuration: configuration, policy: policy, workload: workload)
     }
 
-    /// Selects, measures and falls back between caller-supplied model operations without retaining their content.
-    /// Cloud requirements forbid local execution; the error classifier also governs health backoff.
+    /// Explains the current preference without running either provider or changing calibration.
+    public func decision(
+        inputTokens: Int, localCapacity: Int, now: Date = .now,
+        policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
+        availability: RoutingAvailability = .init()
+    ) -> RoutingDecision {
+        profile.decision(inputTokens: inputTokens, localCapacity: localCapacity, connection: connection,
+            now: now, configuration: configuration, policy: policy, workload: workload, availability: availability)
+    }
+
+    /// Preserves the original value-only API and native error/cancellation behavior.
     public func respond<Value>(
         inputTokens: Int, localContextCapacity: Int,
         policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
         shouldFallback: (InferenceRoute, any Error) -> Bool = { _, error in InferenceExecutor.isRetryable(error) },
-        cloud: () async throws -> Value?,
-        onDevice: () async throws -> Value
+        cloud: () async throws -> Value?, onDevice: () async throws -> Value
     ) async throws -> Value? {
+        try await respondDetailed(inputTokens: inputTokens, localContextCapacity: localContextCapacity,
+            policy: policy, workload: workload, shouldFallback: shouldFallback, cloud: cloud, onDevice: onDevice).value
+    }
+
+    /// Reports original preference, actual provider and attempts without retaining model content.
+    /// Native errors still throw; onAttempt exposes failure/cancellation metadata before propagation.
+    public func respondDetailed<Value>(
+        inputTokens: Int, localContextCapacity: Int,
+        policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
+        availability: RoutingAvailability = .init(),
+        shouldFallback: (InferenceRoute, any Error) -> Bool = { _, error in InferenceExecutor.isRetryable(error) },
+        onAttempt: ((RoutingAttempt) -> Void)? = nil,
+        cloud: () async throws -> Value?, onDevice: () async throws -> Value
+    ) async throws -> RoutingResult<Value> {
         let snapshot = snapshot()
-        let preferred = choose(inputTokens: inputTokens, localCapacity: localContextCapacity, policy: policy, workload: workload)
+        let decision = decision(inputTokens: inputTokens, localCapacity: localContextCapacity,
+            policy: policy, workload: workload, availability: availability)
         let fits = InferenceExecutor.fitsLocal(inputTokens: inputTokens, localCapacity: localContextCapacity,
             responseReserve: max(configuration.localResponseReserve, workload.expectedOutputTokens ?? 0))
-        return try await InferenceExecutor.respond(preferred: preferred, canUseLocalWhole: fits, policy: policy,
+        var attempts: [RoutingAttempt] = []
+        let finish: (RoutingAttempt) -> Void = { attempt in
+            attempts.append(attempt)
+            onAttempt?(attempt)
+        }
+        let value = try await InferenceExecutor.respond(preferred: decision.route,
+            canUseLocalWhole: fits && availability.onDevice, policy: policy,
             shouldFallback: { model, error in
                 let retry = shouldFallback(model, error)
                 if retry && !Task.isCancelled && (model == .onDevice || snapshot.generation == self.generation) {
-                    self.profile.recordFailure(model: model, connection: snapshot.connection, now: .now)
+                    self.profile.recordFailure(model: model, connection: snapshot.connection, now: .now,
+                        configuration: self.configuration)
                     self.save()
                 }
                 return retry
             }, cloud: {
-            try await measure(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
-                workload: workload, recordErrors: false, available: { $0 != nil }, operation: cloud)
-        }, onDevice: {
-            try await measure(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
-                workload: workload, recordErrors: false, operation: onDevice)
-        })
+                guard availability.cloud else { return nil }
+                return try await track(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
+                    workload: workload, available: { $0 != nil }, finish: finish, operation: cloud)
+            }, onDevice: {
+                try await track(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
+                    workload: workload, available: { _ in true }, finish: finish, operation: onDevice)
+            })
+        let status: RoutingResultStatus = value != nil ? .completed
+            : (policy == .automatic && availability.onDevice && !fits ? .requiresChunking : .unavailable)
+        return RoutingResult(value: value, status: status, decision: decision,
+            route: attempts.last(where: { $0.outcome == .succeeded })?.route, attempts: attempts, availability: availability)
+    }
+
+    /// Emits exactly one content-free event per attempted provider, including failed and cancelled operations.
+    private func track<Value>(
+        model: InferenceRoute, inputTokens: Int, snapshot: Snapshot, workload: RoutingWorkload,
+        available: (Value) -> Bool, finish: (RoutingAttempt) -> Void,
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        let started = ContinuousClock.now
+        do {
+            let value = try await measure(model: model, inputTokens: inputTokens, snapshot: snapshot,
+                workload: workload, recordErrors: false, available: available, operation: operation)
+            finish(.init(route: model, seconds: elapsed(since: started),
+                outcome: available(value) ? .succeeded : .unavailable))
+            return value
+        } catch {
+            finish(.init(route: model, seconds: elapsed(since: started),
+                outcome: error is CancellationError || Task.isCancelled ? .cancelled : .failed))
+            throw error
+        }
+    }
+
+    /// Converts monotonic elapsed time into seconds for diagnostics.
+    private func elapsed(since started: ContinuousClock.Instant) -> Double {
+        let duration = started.duration(to: .now).components
+        return Double(duration.seconds) + Double(duration.attoseconds) / 1e18
     }
 
     /// Invalidates cloud history after a path update while preserving device-only speed observations.
@@ -146,7 +207,7 @@ public final class AdaptiveRouter {
             do { try await Task.sleep(for: slowCloudAfter) }
             catch { return }
             guard !Task.isCancelled, let self, snapshot.generation == self.generation else { return }
-            self.profile.recordFailure(connection: snapshot.connection, now: .now)
+            self.profile.recordFailure(connection: snapshot.connection, now: .now, configuration: self.configuration)
             self.save()
         } : nil
         defer { slowWatch?.cancel() }
@@ -158,9 +219,9 @@ public final class AdaptiveRouter {
             if model == .onDevice || snapshot.generation == generation {
                 if available(result) {
                     profile.record(model: model, tokens: inputTokens, seconds: seconds,
-                        connection: snapshot.connection, now: .now, workload: workload)
+                        connection: snapshot.connection, now: .now, workload: workload, configuration: configuration)
                 } else if model == .cloud {
-                    profile.recordFailure(connection: snapshot.connection, now: .now)
+                    profile.recordFailure(connection: snapshot.connection, now: .now, configuration: configuration)
                 }
                 save()
             }
@@ -171,7 +232,7 @@ public final class AdaptiveRouter {
             try Task.checkCancellation()
             if recordErrors && InferenceExecutor.isRetryable(error)
                 && (model == .onDevice || snapshot.generation == generation) {
-                profile.recordFailure(model: model, connection: snapshot.connection, now: .now)
+                profile.recordFailure(model: model, connection: snapshot.connection, now: .now, configuration: configuration)
                 save()
             }
             throw error
