@@ -158,7 +158,10 @@ final class RoutingPolicyTests: XCTestCase {
         do {
             let _: Int? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
                 cloud: {
-                    try await Task.sleep(for: .milliseconds(30))
+                    let cutoff = ContinuousClock.now.advanced(by: .seconds(2))
+                    while router.profile.failures.isEmpty && ContinuousClock.now < cutoff {
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
                     throw ProviderError.refusal
                 }, onDevice: { XCTFail("A slow refusal still cannot trigger immediate fallback."); return 0 })
             XCTFail("The refusal must propagate.")
