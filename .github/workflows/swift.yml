@@ -33,4 +33,4 @@ jobs:
           path: |
             .build/validation/*.log
             .build/validation/summary.json
-            .build/validation/AdaptiveModelRouting.doccarchive
+            .build/validation/AdaptiveModelRouting.doccarchive.zip

@@ -12,6 +12,7 @@ git diff --check
 The validation command runs the package's debug/release tests, external one-import consumer, sample model tests, iOS cross-compilation and DocC conversion. It keeps full logs and `summary.json` under `.build/validation`; inspect those logs for failures instead of repeatedly rerunning unchanged conditions. CI uses the same command on the official `xcode-27` runner image and uploads the evidence and DocC archive.
 
 Artifact upload is best-effort: storage quota failures do not change the validation result. Stage results and bounded failure details remain in the job log.
+The DocC archive is zipped before upload because its generated symbol filenames can contain colons that GitHub artifacts reject.
 
 Add regression tests for changed behavior and maintain at least 85% documentation-comment/docstring coverage. `scripts/check_documentation.py` reports lexical Swift declaration coverage and Python AST docstrings separately. Generated code and build directories are excluded.
 

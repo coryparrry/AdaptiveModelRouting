@@ -109,6 +109,9 @@ def main() -> None:
                  "--fallback-bundle-identifier", "dev.adaptivemodelrouting.documentation", "--fallback-bundle-version", "1",
                  "--output-path", str(artifacts / "AdaptiveModelRouting.doccarchive"), "--warnings-as-errors"],
                  artifacts, environment, results)
+        run_step("documentation-archive", [sys.executable, "-m", "zipfile", "-c",
+                 str(artifacts / "AdaptiveModelRouting.doccarchive.zip"),
+                 str(artifacts / "AdaptiveModelRouting.doccarchive")], artifacts, environment, results)
     print(f"All {len(results)} selected validation steps passed. Evidence: {artifacts}")
 
 
