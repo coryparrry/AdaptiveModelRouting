@@ -32,7 +32,7 @@ public nonisolated struct RoutingWorkload: Codable, Equatable, Sendable {
     }
 
     /// Compares response lengths and the selected provider's session state independently.
-    func isComparable(to other: Self, model: InferenceRoute) -> Bool {
+    func isComparable(to other: Self, model: InferenceRoute, tolerance: Double = 0.25) -> Bool {
         let session = model == .cloud ? cloudSession : localSession
         let otherSession = model == .cloud ? other.cloudSession : other.localSession
         guard session == otherSession else { return false }
@@ -40,7 +40,7 @@ public nonisolated struct RoutingWorkload: Codable, Equatable, Sendable {
         case (nil, nil): return true
         case let (expected?, observed?):
             if expected == 0 { return observed == 0 }
-            return (0.75...1.25).contains(Double(observed) / Double(expected))
+            return ((1 - tolerance)...(1 + tolerance)).contains(Double(observed) / Double(expected))
         default: return false
         }
     }

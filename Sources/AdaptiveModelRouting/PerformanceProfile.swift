@@ -41,64 +41,90 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
     /// Creates an empty history that initially prefers the cloud model.
     public init() {}
 
-    private static let lifetime: TimeInterval = 7 * 86_400
-    private static let retryInterval: TimeInterval = 10 * 60
-    private static let localRefreshInterval: TimeInterval = 30 * 60
-    private static let failureBackoff: TimeInterval = 60
-
-    /// Prefers PCC for quality unless trustworthy local timings show a substantial advantage.
+    /// Returns the preferred lane using the same policy as the explainable decision API.
     public func choose(
         inputTokens: Int, localCapacity: Int, connection: Connection, now: Date,
         configuration: RoutingConfiguration = .init(),
         policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init()
     ) -> InferenceRoute {
-        if policy == .cloudRequired { return .cloud }
-        if connection.kind == .offline || failures.contains(where: {
-            $0.model == .cloud && $0.connection == connection && now.timeIntervalSince($0.date) >= 0
-                && now.timeIntervalSince($0.date) < Self.failureBackoff
-        }) { return .onDevice }
-        guard InferenceExecutor.fitsLocal(inputTokens: inputTokens, localCapacity: localCapacity,
-            responseReserve: max(configuration.localResponseReserve, workload.expectedOutputTokens ?? 0)) else { return .cloud }
-        if failures.contains(where: {
-            $0.model == .onDevice && now.timeIntervalSince($0.date) >= 0
-                && now.timeIntervalSince($0.date) < Self.failureBackoff
-        }) { return .cloud }
-        let localSamples = comparable(.onDevice, tokens: inputTokens, workload: workload, connection: connection, now: now)
-        let cloudSamples = comparable(.cloud, tokens: inputTokens, workload: workload, connection: connection, now: now)
-        let lastLocal = localSamples.first?.date ?? .distantPast
-        // Select one local request after three cloud requests, without duplicating a transcript.
-        if (localSamples.count < 3 || now.timeIntervalSince(lastLocal) >= Self.localRefreshInterval),
-           cloudSamples.filter({ $0.date > lastLocal }).count >= 3 { return .onDevice }
-        guard
-              let local = estimate(.onDevice, tokens: inputTokens, workload: workload, connection: connection, now: now),
-              let cloud = estimate(.cloud, tokens: inputTokens, workload: workload, connection: connection, now: now) else { return .cloud }
-        // Retry the preferred quality model occasionally rather than freezing on old cloud timings.
-        guard now.timeIntervalSince(cloud.latest) < Self.retryInterval else { return .cloud }
-        let conservativeSaving = cloud.seconds - cloud.deviation - local.seconds - local.deviation
-        return conservativeSaving >= max(configuration.minimumLocalSavingSeconds,
-            cloud.seconds * configuration.minimumLocalSavingFraction) ? .onDevice : .cloud
+        decision(inputTokens: inputTokens, localCapacity: localCapacity, connection: connection,
+            now: now, configuration: configuration, policy: policy, workload: workload).route
     }
 
-    /// Records valid completed requests and bounds the local cache to recent metadata.
+    /// Explains quality, availability, health, calibration and predicted-latency decisions.
+    public func decision(
+        inputTokens: Int, localCapacity: Int, connection: Connection, now: Date,
+        configuration: RoutingConfiguration = .balanced, policy: RoutingPolicy = .automatic,
+        workload: RoutingWorkload = .init(), availability: RoutingAvailability = .init()
+    ) -> RoutingDecision {
+        if policy == .cloudRequired { return .init(route: .cloud, reason: .cloudRequired) }
+        if !availability.onDevice && !availability.cloud { return .init(route: .cloud, reason: .noAvailableProvider) }
+        if connection.kind == .offline { return .init(route: .onDevice, reason: .offline) }
+        if !availability.onDevice { return .init(route: .cloud, reason: .localUnavailable) }
+        if !availability.cloud { return .init(route: .onDevice, reason: .cloudUnavailable) }
+        if failures.contains(where: {
+            $0.model == .cloud && $0.connection == connection && now.timeIntervalSince($0.date) >= 0
+                && now.timeIntervalSince($0.date) < configuration.failureBackoff
+        }) { return .init(route: .onDevice, reason: .cloudBackoff) }
+        guard InferenceExecutor.fitsLocal(inputTokens: inputTokens, localCapacity: localCapacity,
+            responseReserve: max(configuration.localResponseReserve, workload.expectedOutputTokens ?? 0))
+            else { return .init(route: .cloud, reason: .localContextExceeded) }
+        if failures.contains(where: {
+            $0.model == .onDevice && now.timeIntervalSince($0.date) >= 0
+                && now.timeIntervalSince($0.date) < configuration.failureBackoff
+        }) { return .init(route: .cloud, reason: .localBackoff) }
+        let localSamples = comparable(.onDevice, tokens: inputTokens, workload: workload,
+            connection: connection, now: now, configuration: configuration)
+        let cloudSamples = comparable(.cloud, tokens: inputTokens, workload: workload,
+            connection: connection, now: now, configuration: configuration)
+        let lastLocal = localSamples.first?.date ?? .distantPast
+        if (localSamples.count < configuration.minimumSamples
+            || now.timeIntervalSince(lastLocal) >= configuration.localRefreshInterval),
+           cloudSamples.filter({ $0.date > lastLocal }).count >= configuration.minimumSamples {
+            return .init(route: .onDevice, reason: .localCalibration)
+        }
+        guard let local = estimate(localSamples, configuration: configuration),
+              let cloud = estimate(cloudSamples, configuration: configuration)
+            else { return .init(route: .cloud, reason: .insufficientEvidence) }
+        let localEstimate = RoutingEstimate(seconds: local.seconds, deviation: local.deviation, sampleCount: local.count)
+        let cloudEstimate = RoutingEstimate(seconds: cloud.seconds, deviation: cloud.deviation, sampleCount: cloud.count)
+        if now.timeIntervalSince(cloud.latest) >= configuration.cloudRetryInterval {
+            return .init(route: .cloud, reason: .cloudRefresh, localEstimate: localEstimate, cloudEstimate: cloudEstimate)
+        }
+        let saving = cloud.seconds - local.seconds
+            - configuration.variabilityAllowance * (cloud.deviation + local.deviation)
+        let useLocal = saving >= max(configuration.minimumLocalSavingSeconds,
+            cloud.seconds * configuration.minimumLocalSavingFraction)
+        return .init(route: useLocal ? .onDevice : .cloud, reason: useLocal ? .localFaster : .cloudPreferred,
+            localEstimate: localEstimate, cloudEstimate: cloudEstimate)
+    }
+
+    /// Bounds each provider's history independently so frequent cloud calls cannot evict local calibration.
     public mutating func record(
         model: InferenceRoute, tokens: Int, seconds: Double,
-        connection: Connection, now: Date, workload: RoutingWorkload = .init()
+        connection: Connection, now: Date, workload: RoutingWorkload = .init(),
+        configuration: RoutingConfiguration = .balanced
     ) {
         guard tokens > 0, seconds.isFinite, seconds > 0 else { return }
-        samples.removeAll { now.timeIntervalSince($0.date) < 0 || now.timeIntervalSince($0.date) > Self.lifetime }
+        samples.removeAll { now.timeIntervalSince($0.date) < 0 || now.timeIntervalSince($0.date) > configuration.sampleLifetime }
         samples.append(Sample(model: model, tokens: tokens, seconds: seconds, connection: connection, date: now, workload: workload))
-        samples = Array(samples.suffix(128))
+        var excess = samples.lazy.filter { $0.model == model }.count - 128
+        samples.removeAll { sample in
+            guard excess > 0, sample.model == model else { return false }
+            excess -= 1
+            return true
+        }
         failures.removeAll { $0.model == model && (model == .onDevice || $0.connection == connection) }
-        failures.removeAll { now.timeIntervalSince($0.date) > Self.failureBackoff }
+        failures.removeAll { now.timeIntervalSince($0.date) > configuration.failureBackoff }
     }
 
     /// Applies a short cooldown after a model failure, cloud unavailability or quota exhaustion.
     public mutating func recordFailure(
-        model: InferenceRoute = .cloud, connection: Connection, now: Date
+        model: InferenceRoute = .cloud, connection: Connection, now: Date, configuration: RoutingConfiguration = .balanced
     ) {
         failures.removeAll {
             ($0.model == model && (model == .onDevice || $0.connection == connection))
-                || now.timeIntervalSince($0.date) > Self.failureBackoff
+                || now.timeIntervalSince($0.date) > configuration.failureBackoff
         }
         failures.append(Failure(model: model, connection: connection, date: now))
         failures = Array(failures.suffix(16))
@@ -112,10 +138,10 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
 
     /// Estimates weighted latency and spread; overlapping one-deviation ranges retain cloud preference.
     private func estimate(
-        _ model: InferenceRoute, tokens: Int, workload: RoutingWorkload, connection: Connection, now: Date
-    ) -> (seconds: Double, deviation: Double, latest: Date)? {
-        let nearby = comparable(model, tokens: tokens, workload: workload, connection: connection, now: now).prefix(6)
-        guard nearby.count >= 3, let latest = nearby.first?.date else { return nil }
+        _ samples: [Sample], configuration: RoutingConfiguration
+    ) -> (seconds: Double, deviation: Double, count: Int, latest: Date)? {
+        let nearby = samples.prefix(configuration.predictionSampleLimit)
+        guard nearby.count >= configuration.minimumSamples, let latest = nearby.first?.date else { return nil }
         var total = 0.0
         var weights = 0.0
         for (index, sample) in nearby.enumerated() {
@@ -128,20 +154,21 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
             let difference = entry.element.seconds - mean
             return result + pow(0.5, Double(entry.offset)) * difference * difference
         } / weights
-        return (mean, sqrt(variance), latest)
+        return (mean, sqrt(variance), nearby.count, latest)
     }
 
     /// Finds only recent, similarly sized observations, newest first.
     private func comparable(
-        _ model: InferenceRoute, tokens: Int, workload: RoutingWorkload, connection: Connection, now: Date
+        _ model: InferenceRoute, tokens: Int, workload: RoutingWorkload, connection: Connection, now: Date,
+        configuration: RoutingConfiguration
     ) -> [Sample] {
         guard tokens > 0 else { return [] }
         return samples.filter {
             let age = now.timeIntervalSince($0.date)
             let ratio = Double($0.tokens) / Double(tokens)
             return $0.model == model && (model == .onDevice || $0.connection == connection)
-                && workload.isComparable(to: $0.workload ?? .init(), model: model)
-                && age >= 0 && age <= Self.lifetime && (0.75...1.25).contains(ratio)
+                && workload.isComparable(to: $0.workload ?? .init(), model: model, tolerance: configuration.sizeTolerance)
+                && age >= 0 && age <= configuration.sampleLifetime && ((1 - configuration.sizeTolerance)...(1 + configuration.sizeTolerance)).contains(ratio)
         }.sorted { $0.date > $1.date }
     }
 }
