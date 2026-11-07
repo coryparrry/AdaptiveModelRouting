@@ -58,6 +58,7 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
         workload: RoutingWorkload = .init(), availability: RoutingAvailability = .init()
     ) -> RoutingDecision {
         if policy == .cloudRequired { return .init(route: .cloud, reason: .cloudRequired) }
+        if policy == .localOnly { return .init(route: .onDevice, reason: .localOnly) }
         if !availability.onDevice && !availability.cloud { return .init(route: .cloud, reason: .noAvailableProvider) }
         if connection.kind == .offline { return .init(route: .onDevice, reason: .offline) }
         if !availability.onDevice { return .init(route: .cloud, reason: .localUnavailable) }

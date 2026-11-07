@@ -1,0 +1,35 @@
+name: Swift validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate package, sample, consumer and documentation
+        id: validation
+        run: python3 scripts/validate.py
+      - name: Upload validation logs and documentation
+        if: always() && steps.validation.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swift-validation
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            .build/validation/*.log
+            .build/validation/summary.json
+            .build/validation/AdaptiveModelRouting.doccarchive

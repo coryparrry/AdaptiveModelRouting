@@ -25,4 +25,13 @@ public final class AppleGenerator {
     public func summarize(_ text: String) async throws -> RoutingResult<Summary> {
         try await router.respondDetailed(to: text, generating: Summary.self)
     }
+
+    /// Streams native partial fields through the same single routing product and explicit local-only policy.
+    public func streamSummary(_ text: String) -> AsyncThrowingStream<RoutingStreamEvent<Summary.PartiallyGenerated>, any Error> {
+        router.stream(to: text, generating: Summary.self, policy: .localOnly)
+    }
 }
+
+/// Allows public partial snapshots to cross the stream boundary with compiler-checked stored fields.
+@available(iOS 27.0, macOS 27.0, *)
+extension AppleGenerator.Summary.PartiallyGenerated: Sendable {}

@@ -32,6 +32,7 @@ let router = FoundationModelsRouter(
 
 let summary = try await router.respond(to: transcript)
 let complexAnswer = try await router.respond(to: complexQuestion, policy: .cloudRequired)
+let privateSummary = try await router.respond(to: transcript, policy: .localOnly)
 ```
 
 The adapter checks local/PCC readiness and known PCC quota exhaustion, creates a fresh session per operation, tokenizes the complete local transcript, and maps Apple's explicit network, quota, service, timeout and rate-limit errors to recovery. Unknown errors, refusals, guardrail violations and context-limit errors propagate unchanged. PCC still requires Apple's managed entitlement in the consuming app; constructing an adapter does not grant access.
@@ -40,9 +41,9 @@ The default output limit is 512 tokens. Supply Apple's `GenerationOptions` as `o
 
 For structured output, import `FoundationModels`, declare an `@Generable` type, and call `respond(to:generating:)` or `respondDetailed(to:generating:)`. The schema participates in local token counting. [AppleGenerator](AppleExamples/AppleGenerator.swift) is a compiled structured-output example.
 
-This initial adapter supports text and structured output with fresh sessions, without tools or shared conversation histories. Its local token count is a routing size measure, not a claim about the PCC tokenizer. PCC enforces its own context limit; native context errors remain visible. Cloud-required requests skip local tokenization entirely. If local tokenization is unavailable or fails recoverably, a permitted cloud request can proceed without local calibration; the adapter does not invent an input token count for training.
+The adapter supports text, structured output and streaming with fresh sessions, without tools or shared conversation histories. Its local token count is a routing size measure, not a claim about the PCC tokenizer. PCC enforces its own context limit; native context errors remain visible. Cloud-required requests skip local tokenization entirely. If local tokenization is unavailable or fails recoverably, a permitted cloud request can proceed without local calibration; the adapter does not invent an input token count for training.
 
-Workload names select fixed-length, hashed cache-directory names. Use a distinct workload for different instructions, models or generation settings and keep one owner per workload/cache root. Customize `cacheRoot`, `localModel`, `cloudModel` and `shouldFallback` at initialization when needed.
+Workload names select fixed-length, hashed cache-directory names within an app-specific namespace. The adapter automatically resets calibration when instructions, schema, generation options, app build or model identity change. Supply a stable `modelIdentifier` for custom model objects to retain their calibration between launches; opaque custom models otherwise receive a fresh identity. Keep one owner per workload/cache root. Customize `cacheRoot`, `localModel`, `cloudModel` and `shouldFallback` at initialization when needed.
 
 ## Presets and overrides
 
@@ -111,6 +112,8 @@ When using Apple Foundation Models, your app owns model availability/quota check
 
 ## Quality requirements and errors
 
+Use `policy: .localOnly` for requests that must stay on device. It never attempts cloud generation or cloud recovery, and the Apple adapter skips PCC readiness and quota checks. If local inference is unavailable or the request exceeds its capacity, the result reports that condition. Native local tokenization errors still propagate when they cannot be recovered without cloud access.
+
 Use `policy: .cloudRequired` when a task requires cloud capabilities. This overrides learned speed, local calibration, offline selection and all local fallback. If cloud returns `nil`, the request returns `nil`; if cloud throws, its error reaches the caller. The router never relaxes this constraint automatically.
 
 The default error policy permits fallback for recognized temporary `URLError` failures such as timeout or lost connectivity. Other errors propagate unchanged and do not themselves record a model-health failure. In particular, unknown provider errors, safety refusals, invalid input and certificate failures do not trigger another model automatically. This changes the previous behavior that retried every non-cancellation error.
@@ -132,6 +135,28 @@ let result: String? = try await router.respond(
 
 The classifier runs once per thrown provider error, including terminal failures when there is no permitted fallback. Returning `true` records health backoff and permits the other lane only if the request policy and capacity allow it. Each lane is attempted at most once. Cancellation bypasses the classifier. Slow-request backoff is independent: a cloud request that exceeds `slowCloudAfter` can already have triggered backoff even if it later throws a nonretryable error or is cancelled. Cloud-required requests still never run local inference. A provider that performs tool calls or other side effects must make retries safe before the app enables fallback.
 
+## Deadlines and streaming
+
+Requests have a **60-second overall deadline** by default, covering adapter preflight, generation and any fallback. Override it with `deadline: .after(.seconds(15))`, set the configuration's `requestDeadline`, or explicitly choose `.unlimited`. Expiry throws `RoutingRequestError.deadlineExceeded` and reports a `.timedOut` attempt if a provider was running. Expiry never starts fallback.
+
+The router returns promptly when an asynchronous provider ignores cancellation, discards its late output and prevents late timing updates. Providers should still cooperate with task cancellation: the router cannot stop remote work or interrupt synchronous code that blocks the main actor.
+
+```swift
+let task = Task { @MainActor in
+    for try await event in router.stream(to: transcript, deadline: .after(.seconds(15))) {
+        switch event {
+        case .selected(let decision): print(decision.reason.rawValue)
+        case .update(let text, let route): render(text, from: route)
+        case .completed(let result): print(result.attempts)
+        }
+    }
+}
+// Cancel this task to stop consuming and request provider cancellation.
+task.cancel()
+```
+
+Updates are cumulative snapshots, so replace the displayed response instead of appending. Slow consumers may skip intermediate snapshots; the completed result retains the final snapshot. Fallback is allowed only before the first published update. An error after partial output terminates the stream without switching models. Structured streaming uses `stream(to:generating:)` with a `Sendable` partially generated type. The core router also accepts provider stream closures.
+
 ## Learning and recovery
 
 - Initially prefers cloud inference, with a product preference for its reasoning quality rather than a claim that it is always more accurate.
@@ -142,7 +167,7 @@ The classifier runs once per thrown provider error, including terminal failures 
 - By default, local must save at least **350 ms** and **25%** of predicted cloud latency. Both margins and the local response reserve are configurable.
 - Separates cloud history by Wi-Fi, cellular, wired/other, and expensive/constrained path flags. Local timings remain device-specific across connections.
 - Backs off for 60 seconds after failure, and periodically retries cloud after ten minutes rather than freezing on an old slow connection. Local calibration can refresh after 30 minutes.
-- Marks cloud requests still pending after the configured slow limit (20 seconds by default) for health backoff. This watch does not terminate the request: the consuming app should supply its own overall deadline/cancellation policy.
+- Marks cloud requests still pending after the configured slow limit (20 seconds by default) for health backoff. This watch is separate from the overall request deadline.
 
 Use `PerformanceProfile` directly for deterministic policy decisions, `InferenceExecutor` for fallback execution alone, or `AdaptiveRouter` for integrated observation, persistence and execution. `monitorConnection: false` and `updateConnection` support deterministic testing or caller-owned network observation.
 
@@ -150,20 +175,33 @@ Use `PerformanceProfile` directly for deterministic policy decisions, `Inference
 
 History retains at most 128 timings per provider (256 total), so frequent requests to one provider cannot evict the other provider's calibration. Prediction sample limits and minimums cannot exceed 128.
 
-The bounded, backup-excluded cache contains only route, input token count, expected output token count, session-reuse flags, elapsed time, timestamp, coarse path flags and OS version. It stores no prompts, outputs, meeting questions, SSIDs, IP addresses or account identifiers. Older caches without workload metadata remain readable as fresh sessions with unspecified output size. iPhone cache files use protection until first authentication. OS updates reset calibration, and unreadable caches are preserved instead of overwritten. There is no built-in telemetry or calibration server.
+The bounded, backup-excluded cache contains only route, input token count, expected output token count, session-reuse flags, elapsed time, timestamp, coarse path flags, OS version and an optional opaque calibration-identity digest. It stores no prompts, outputs, meeting questions, SSIDs, IP addresses or account identifiers. Older caches without workload metadata remain readable as fresh sessions with unspecified output size. iPhone cache files use protection until first authentication. OS updates reset calibration, and unreadable caches are preserved instead of overwritten. There is no built-in telemetry or calibration server.
+
+Initialize either router with `persistence: .memoryOnly` to avoid reading or writing calibration files. `setPersistence(.memoryOnly)` removes its existing cache by default; `resetProfile()` clears learned timings and health backoff. In-flight requests cannot repopulate a reset profile. Inspect `storageStatus` to distinguish memory-only operation, successful persistence and storage errors without failing inference. The core's `updateCalibrationIdentifier(_:)` supports caller-owned model or workload versioning.
+
+Default storage is isolated by app bundle identifier (or executable path for command-line tools). Previous shared default caches remain untouched; the new namespace starts fresh. Explicit cache directories retain their existing behavior.
 
 The app controls what its inference closures send to a cloud provider. Use one owner per cache directory; sharing a directory between multiple router instances or processes is not supported.
 
 ## Verify
 
 ```sh
-swift test
-swift test -c release
-swift build -c release
-swift build --package-path Tests/SingleImportConsumer
+python3 scripts/validate.py
 ```
 
-Tests use injected timings, provider closures and Apple backend operations, require no cloud entitlement, and make no model requests. They cover bootstrap, presets, diagnostics, device/connection differences, recovery, persistence, cancellation, legacy API use, native error classification and Generable decoding. Both examples compile. The separate consumer fixture verifies that the Apple adapter, explicit configuration and detailed results work with one product and one import. Actual tokenization, generation quality, signed PCC access and live network handoff still require qualification in a consuming app.
+The validator runs Debug and Release tests, the Release build, a separate single-import consumer, sample tests, an iOS 26 deployment-target build, documentation coverage and a warning-free DocC build. It saves logs and a summary under `.build/validation`. GitHub Actions runs the same checks on an Xcode 27 runner. See [CONTRIBUTING.md](CONTRIBUTING.md) for focused commands.
+
+Tests use injected timings, provider closures and Apple backend operations, require no cloud entitlement, and make no model requests. They cover policies, deadlines, streaming, late cancellation, profile lifecycle, presets, diagnostics, connection differences, recovery, persistence, native error classification and Generable decoding. Both examples compile. The consumer fixture verifies one product and one import, including streaming. Actual tokenization, generation quality, signed PCC access and live network handoff remain deferred qualification work; this change does not publish a release.
+
+## Try the sample and documentation
+
+```sh
+swift run --package-path Demo RoutingDemo
+```
+
+The [native sample](Demo/README.md) starts with simulated providers and local-only routing. Its Advanced controls expose presets, deadlines, cloud faults, attempt diagnostics and profile storage. Apple mode is opt-in and requires a suitable device and signed consuming app for PCC access.
+
+Open the package in Xcode and choose **Build Documentation**, or open `.build/validation/AdaptiveModelRouting.doccarchive` after validation. The DocC guides cover [getting started](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/GettingStarted.md), [policies and deadlines](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/PoliciesAndDeadlines.md), [streaming](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/StreamingResponses.md) and [calibration storage](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/CalibrationAndStorage.md).
 
 ## License
 

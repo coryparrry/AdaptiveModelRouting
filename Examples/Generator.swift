@@ -12,8 +12,8 @@ public final class Generator {
     public func generate(
         inputTokens: Int, localContextCapacity: Int,
         policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
-        cloud: () async throws -> String?,
-        onDevice: () async throws -> String
+        cloud: @escaping @MainActor () async throws -> String?,
+        onDevice: @escaping @MainActor () async throws -> String
     ) async throws -> String? {
         try await router.respond(inputTokens: inputTokens, localContextCapacity: localContextCapacity,
             policy: policy, workload: workload, cloud: cloud, onDevice: onDevice)
