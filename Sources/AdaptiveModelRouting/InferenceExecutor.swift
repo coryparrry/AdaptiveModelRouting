@@ -4,6 +4,7 @@ import Foundation
 public nonisolated enum InferenceExecutor {
     /// Retries only recognized temporary network failures; apps classify model-specific errors.
     public static func isRetryable(_ error: any Error) -> Bool {
+        if (error as? RoutingRequestError) == .emptyStream { return true }
         guard let error = error as? URLError else { return false }
         switch error.code {
         case .timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
@@ -30,7 +31,21 @@ public nonisolated enum InferenceExecutor {
         cloud: () async throws -> Value?,
         onDevice: () async throws -> Value
     ) async throws -> Value? {
+        try await execute(preferred: preferred, canUseLocalWhole: canUseLocalWhole, policy: policy,
+            canFallback: { true }, shouldFallback: shouldFallback, cloud: cloud, onDevice: onDevice)
+    }
+
+    /// Applies a dynamic fallback barrier without conflating model-health classification with retry permission.
+    @MainActor
+    static func execute<Value>(preferred: InferenceRoute, canUseLocalWhole: Bool, policy: RoutingPolicy,
+        canFallback: () -> Bool, shouldFallback: (InferenceRoute, any Error) -> Bool,
+        cloud: () async throws -> Value?, onDevice: () async throws -> Value
+    ) async throws -> Value? {
         try Task.checkCancellation()
+        if policy == .localOnly {
+            guard canUseLocalWhole else { return nil }
+            return try await finalAttempt(model: .onDevice, shouldFallback: shouldFallback, operation: onDevice)
+        }
         if preferred == .onDevice && policy != .cloudRequired {
             guard canUseLocalWhole else { return nil }
             do {
@@ -40,9 +55,11 @@ public nonisolated enum InferenceExecutor {
             } catch is CancellationError { throw CancellationError() }
             catch {
                 try Task.checkCancellation()
+                if (error as? RoutingRequestError) == .deadlineExceeded { throw error }
                 let retry = shouldFallback(.onDevice, error)
                 try Task.checkCancellation()
-                guard retry else { throw error }
+                guard retry, canFallback() else { throw error }
+                try Task.checkCancellation()
                 return try await finalAttempt(model: .cloud, shouldFallback: shouldFallback, operation: cloud)
             }
         }
@@ -53,9 +70,11 @@ public nonisolated enum InferenceExecutor {
         } catch is CancellationError { throw CancellationError() }
         catch {
             try Task.checkCancellation()
+            if (error as? RoutingRequestError) == .deadlineExceeded { throw error }
             let retry = shouldFallback(.cloud, error)
             try Task.checkCancellation()
-            guard retry, policy != .cloudRequired, canUseLocalWhole else { throw error }
+            guard retry, policy != .cloudRequired, canUseLocalWhole, canFallback() else { throw error }
+            try Task.checkCancellation()
         }
         try Task.checkCancellation()
         guard policy != .cloudRequired, canUseLocalWhole else { return nil }
@@ -75,6 +94,7 @@ public nonisolated enum InferenceExecutor {
         } catch is CancellationError { throw CancellationError() }
         catch {
             try Task.checkCancellation()
+            if (error as? RoutingRequestError) == .deadlineExceeded { throw error }
             _ = shouldFallback(model, error)
             try Task.checkCancellation()
             throw error

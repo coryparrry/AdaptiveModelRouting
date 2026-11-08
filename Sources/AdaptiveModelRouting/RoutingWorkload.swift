@@ -6,6 +6,8 @@ public nonisolated enum RoutingPolicy: Equatable, Sendable {
     case automatic
     /// Uses only cloud inference, including when offline, unavailable or failing.
     case cloudRequired
+    /// Runs only local inference, without inspecting or invoking a cloud provider.
+    case localOnly
 }
 
 /// Describes expected generation work without storing prompts or generated content.

@@ -24,6 +24,16 @@ final class FoundationModelsRouterTests: XCTestCase {
         var limits: [Int?] = []
         var cloudError: (any Error)?
         var tokenError: (any Error)?
+        var localError: (any Error)?
+        var tokenProvider: ControlledRoutingProvider?
+        var inspectedPolicies: [RoutingPolicy] = []
+
+        /// Records which hard policy the adapter applies before inspecting provider readiness.
+        func availability(for policy: RoutingPolicy) -> RoutingAvailability {
+            inspectedPolicies.append(policy)
+            return .init(onDevice: policy != .cloudRequired && availability.onDevice,
+                cloud: policy != .localOnly && availability.cloud)
+        }
 
         /// Records full-prompt preflight inputs without contacting a tokenizer service.
         func inputTokens(prompt: String, instructions: String?, schema: GenerationSchema?) async throws -> Int {
@@ -31,6 +41,7 @@ final class FoundationModelsRouterTests: XCTestCase {
             sawSchema = schema != nil
             self.instructions = instructions
             if let tokenError { throw tokenError }
+            if let tokenProvider { _ = await tokenProvider.call() }
             return tokens
         }
 
@@ -41,6 +52,7 @@ final class FoundationModelsRouterTests: XCTestCase {
             self.instructions = instructions
             limits.append(options.maximumResponseTokens)
             if route == .cloud, let cloudError { throw cloudError }
+            if route == .onDevice, let localError { throw localError }
             return route == .cloud ? "cloud" : "local"
         }
 
@@ -225,5 +237,134 @@ final class FoundationModelsRouterTests: XCTestCase {
         XCTAssertTrue(backend.routes.isEmpty)
         XCTAssertTrue(router.router.profile.samples.isEmpty)
         XCTAssertTrue(router.router.profile.failures.isEmpty)
+    }
+
+    /// Local-only readiness and native execution never inspect or attempt the cloud lane.
+    func testLocalOnlyMasksCloudAndPreservesLocalErrors() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result = try await router.respondDetailed(to: "Private summary", policy: .localOnly)
+        XCTAssertEqual(result.value, "local")
+        XCTAssertEqual(result.decision.reason, .localOnly)
+        XCTAssertFalse(result.availability.cloud)
+        XCTAssertEqual(backend.inspectedPolicies, [.localOnly])
+        backend.localError = URLError(.timedOut)
+        do {
+            _ = try await router.respond(to: "Private summary", policy: .localOnly)
+            XCTFail("A local failure must not authorize cloud.")
+        } catch let error as URLError { XCTAssertEqual(error.code, .timedOut) }
+        XCTAssertEqual(backend.routes, [.onDevice, .onDevice])
+    }
+
+    /// The request deadline starts before token counting rather than only before inference.
+    func testDeadlineIncludesPreflight() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let provider = ControlledRoutingProvider()
+        backend.tokenProvider = provider
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
+        defer { safety.cancel(); provider.release() }
+        var attempts: [RoutingAttempt] = []
+        let task = Task {
+            try await router.respondDetailed(to: "Summary", deadline: .after(.milliseconds(200)), onAttempt: { attempts.append($0) })
+        }
+        await provider.started.wait()
+        do { _ = try await task.value; XCTFail("Preflight must share the request deadline.") }
+        catch RoutingRequestError.deadlineExceeded {}
+        XCTAssertFalse(provider.released)
+        XCTAssertTrue(backend.routes.isEmpty)
+        XCTAssertTrue(attempts.isEmpty)
+        provider.release()
+        await provider.finished.wait()
+        XCTAssertTrue(router.router.profile.samples.isEmpty)
+    }
+
+    /// Text streaming returns metadata and never adds an extra generation request.
+    func testTextStreamingUsesOnePermittedProvider() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var result: RoutingResult<String>?
+        for try await event in router.stream(to: "Summary", policy: .localOnly) {
+            if case .completed(let value) = event { result = value }
+        }
+        XCTAssertEqual(result?.value, "local")
+        XCTAssertEqual(backend.routes, [.onDevice])
+        XCTAssertEqual(backend.tokenCalls, 1)
+    }
+
+    /// Native partial-field output uses the concrete generated schema and a single model request.
+    func testTypedStreamingUsesPartialFields() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var result: RoutingResult<Summary.PartiallyGenerated>?
+        for try await event in router.stream(to: "Summary", generating: Summary.self) {
+            if case .completed(let value) = event { result = value }
+        }
+        XCTAssertEqual(result?.value?.text, "typed output")
+        XCTAssertTrue(backend.sawSchema)
+        XCTAssertEqual(backend.routes, [.cloud])
+    }
+
+    /// Instruction, schema, sampling and model-identity changes invalidate calibration automatically.
+    func testGenerationIdentityChangesInvalidateCalibration() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for _ in 0..<2 { _ = try await router.respond(to: "Summary") }
+        XCTAssertEqual(router.router.profile.samples.count, 2)
+        let instructions = "PRIVATE-INSTRUCTIONS-DO-NOT-STORE"
+        let other = FoundationModelsRouter(router: router.router, instructions: instructions,
+            options: .init(maximumResponseTokens: 512), backend: backend)
+        _ = try await other.respond(to: "Summary")
+        XCTAssertEqual(router.router.profile.samples.count, 1)
+        for _ in 0..<2 { _ = try await other.respond(to: "Summary", generating: Summary.self) }
+        XCTAssertEqual(router.router.profile.samples.count, 2, "Stable schemas must not reset on each request.")
+        let options = GenerationOptions(temperature: 0.3, maximumResponseTokens: 512)
+        let changed = FoundationModelsRouter(router: router.router, instructions: instructions, options: options, backend: backend)
+        _ = try await changed.respond(to: "Summary", generating: Summary.self)
+        XCTAssertEqual(router.router.profile.samples.count, 1)
+        let model = FoundationModelsRouter(router: router.router, instructions: instructions, options: options,
+            backend: backend, modelIdentifier: "MODEL-VERSION-PRIVATE")
+        _ = try await model.respond(to: "Summary", generating: Summary.self)
+        XCTAssertEqual(router.router.profile.samples.count, 1)
+        let cached = try String(contentsOf: directory.appendingPathComponent("latency.json"), encoding: .utf8)
+        XCTAssertFalse(cached.contains(instructions))
+        XCTAssertFalse(cached.contains("MODEL-VERSION-PRIVATE"))
+    }
+
+    /// Relaunching restores a stable native identity while the next changed schema still resets calibration.
+    func testStableIdentitySurvivesRouterRecreation() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for _ in 0..<2 { _ = try await router.respond(to: "Summary") }
+        let restored = FoundationModelsRouter(
+            router: AdaptiveRouter(directory: directory, monitorConnection: false),
+            instructions: "Summarize clearly", options: .init(maximumResponseTokens: 512), backend: backend)
+        XCTAssertEqual(restored.profile.samples.count, 2)
+        _ = try await restored.respond(to: "Another summary")
+        XCTAssertEqual(restored.profile.samples.count, 3)
+        _ = try await restored.respond(to: "Structured summary", generating: Summary.self)
+        XCTAssertEqual(restored.profile.samples.count, 1)
+    }
+
+    /// Suspended text preflight cannot accidentally train the structured request's active calibration bucket.
+    func testConcurrentPreflightKeepsCalibrationIdentityIsolated() async throws {
+        let (router, backend, directory) = fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let provider = ControlledRoutingProvider()
+        backend.tokenProvider = provider
+        let safety = Task { try? await Task.sleep(for: .seconds(5)); provider.release() }
+        defer { safety.cancel(); provider.release() }
+        let text = Task { try await router.respond(to: "Text request") }
+        await provider.started.wait()
+        backend.tokenProvider = nil
+        _ = try await router.respond(to: "Structured request", generating: Summary.self)
+        XCTAssertEqual(router.router.profile.samples.count, 1)
+        let file = directory.appendingPathComponent("latency.json")
+        let structuredIdentity = (try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])?["identity"] as? String
+        provider.release()
+        _ = try await text.value
+        XCTAssertEqual(router.router.profile.samples.count, 1)
+        let textIdentity = (try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])?["identity"] as? String
+        XCTAssertNotEqual(textIdentity, structuredIdentity)
     }
 }

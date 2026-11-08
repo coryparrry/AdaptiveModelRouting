@@ -223,7 +223,7 @@ final class AdaptiveRouterTests: XCTestCase {
         XCTAssertTrue(router.profile.failures.isEmpty)
     }
 
-    /// Stalled cloud inference triggers backoff before the caller's 22-second deadline cancels it.
+    /// Stalled cloud inference records backoff before caller cancellation without training latency.
     @MainActor
     func testSlowCloudCancellationBacksOffWithoutTrainingLatency() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -232,7 +232,10 @@ final class AdaptiveRouterTests: XCTestCase {
             configuration: .init(slowCloudAfter: .milliseconds(5)))
         do {
             let _: Int = try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: router.snapshot()) {
-                try await Task.sleep(for: .milliseconds(30))
+                let cutoff = ContinuousClock.now.advanced(by: .seconds(2))
+                while router.profile.failures.isEmpty && ContinuousClock.now < cutoff {
+                    try await Task.sleep(for: .milliseconds(20))
+                }
                 XCTAssertEqual(router.choose(inputTokens: 2_000, localCapacity: 8_192), .onDevice)
                 throw CancellationError()
             }

@@ -43,6 +43,8 @@ public nonisolated struct RoutingConfiguration: Sendable {
     public let sampleLifetime: TimeInterval
     /// Number of weighted standard deviations applied to each provider's latency estimate.
     public let variabilityAllowance: Double
+    /// Bounds preflight, generation and recovery together; unlimited must be selected explicitly.
+    public let requestDeadline: RoutingDeadline
 
     /// Preserves the original cloud-first policy and one-deviation timing allowance.
     public static var balanced: Self { .init() }
@@ -65,7 +67,7 @@ public nonisolated struct RoutingConfiguration: Sendable {
         minimumSamples: Int = 3, predictionSampleLimit: Int = 6, sizeTolerance: Double = 0.25,
         failureBackoff: TimeInterval = 60, cloudRetryInterval: TimeInterval = 600,
         localRefreshInterval: TimeInterval = 1_800, sampleLifetime: TimeInterval = 7 * 86_400,
-        variabilityAllowance: Double = 1
+        variabilityAllowance: Double = 1, requestDeadline: RoutingDeadline = .after(.seconds(60))
     ) {
         precondition(localResponseReserve >= 0)
         precondition(minimumLocalSavingSeconds.isFinite && minimumLocalSavingSeconds >= 0)
@@ -77,6 +79,7 @@ public nonisolated struct RoutingConfiguration: Sendable {
             precondition(interval.isFinite && interval > 0)
         }
         precondition(variabilityAllowance.isFinite && variabilityAllowance >= 0)
+        if case .after(let duration) = requestDeadline { precondition(duration > .zero) }
         self.localResponseReserve = localResponseReserve
         self.minimumLocalSavingSeconds = minimumLocalSavingSeconds
         self.minimumLocalSavingFraction = minimumLocalSavingFraction
@@ -89,6 +92,7 @@ public nonisolated struct RoutingConfiguration: Sendable {
         self.localRefreshInterval = localRefreshInterval
         self.sampleLifetime = sampleLifetime
         self.variabilityAllowance = variabilityAllowance
+        self.requestDeadline = requestDeadline
     }
 
     /// Overrides selected preset values while retaining validation and all unspecified settings.
@@ -98,7 +102,8 @@ public nonisolated struct RoutingConfiguration: Sendable {
         slowCloudAfter: Duration? = nil, minimumSamples: Int? = nil, predictionSampleLimit: Int? = nil,
         sizeTolerance: Double? = nil, failureBackoff: TimeInterval? = nil,
         cloudRetryInterval: TimeInterval? = nil, localRefreshInterval: TimeInterval? = nil,
-        sampleLifetime: TimeInterval? = nil, variabilityAllowance: Double? = nil
+        sampleLifetime: TimeInterval? = nil, variabilityAllowance: Double? = nil,
+        requestDeadline: RoutingDeadline? = nil
     ) {
         self.init(localResponseReserve: localResponseReserve ?? preset.localResponseReserve,
             minimumLocalSavingSeconds: minimumLocalSavingSeconds ?? preset.minimumLocalSavingSeconds,
@@ -111,6 +116,7 @@ public nonisolated struct RoutingConfiguration: Sendable {
             cloudRetryInterval: cloudRetryInterval ?? preset.cloudRetryInterval,
             localRefreshInterval: localRefreshInterval ?? preset.localRefreshInterval,
             sampleLifetime: sampleLifetime ?? preset.sampleLifetime,
-            variabilityAllowance: variabilityAllowance ?? preset.variabilityAllowance)
+            variabilityAllowance: variabilityAllowance ?? preset.variabilityAllowance,
+            requestDeadline: requestDeadline ?? preset.requestDeadline)
     }
 }

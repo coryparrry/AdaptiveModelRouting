@@ -21,7 +21,7 @@ public nonisolated struct RoutingEstimate: Equatable, Sendable {
 
 /// Explains why a provider was preferred before execution or fallback.
 public nonisolated enum RoutingReason: String, Sendable {
-    case cloudRequired, cloudPreferred, localCalibration, localFaster, offline
+    case cloudRequired, localOnly, cloudPreferred, localCalibration, localFaster, offline
     case cloudBackoff, localBackoff, insufficientEvidence, cloudRefresh
     case localUnavailable, cloudUnavailable, localContextExceeded, noAvailableProvider
 }
@@ -46,7 +46,7 @@ public nonisolated struct RoutingDecision: Equatable, Sendable {
 /// Timing and disposition for one attempted operation, without prompts, outputs or raw errors.
 public nonisolated struct RoutingAttempt: Equatable, Sendable {
     /// A nil cloud response is unavailable rather than a successful inference.
-    public enum Outcome: String, Sendable { case succeeded, unavailable, failed, cancelled }
+    public enum Outcome: String, Sendable { case succeeded, unavailable, failed, cancelled, timedOut }
     public let route: InferenceRoute
     public let seconds: Double
     public let outcome: Outcome
