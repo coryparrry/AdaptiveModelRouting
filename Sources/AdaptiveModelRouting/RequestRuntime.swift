@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Limits the entire request, including adapter preflight and all permitted recovery attempts.
 public nonisolated enum RoutingDeadline: Equatable, Sendable {
@@ -91,6 +92,33 @@ private final class RoutingActorValue<Value> {
     init(_ value: Value) { self.value = value }
 }
 
+/// Cancels the worker synchronously from any executor, including cancellation before worker registration.
+private nonisolated final class RoutingRequestCancellation: Sendable {
+    private let state = Mutex<(cancelled: Bool, worker: Task<Void, Never>?)>((false, nil))
+
+    /// Installs the worker or immediately cancels it if the caller already cancelled.
+    func register(_ worker: Task<Void, Never>) {
+        let cancelled = state.withLock { state in
+            if state.cancelled { return true }
+            state.worker = worker
+            return false
+        }
+        if cancelled { worker.cancel() }
+    }
+
+    /// Marks cancellation before releasing the lock, then invokes task handlers outside the lock.
+    func cancel() {
+        let worker = state.withLock { state in
+            state.cancelled = true
+            return state.worker
+        }
+        worker?.cancel()
+    }
+
+    /// Drops the task handle after resolution so an abandoned provider cannot form a retention cycle.
+    func clear() { state.withLock { $0.worker = nil } }
+}
+
 /// Resolves a request once, returning promptly while asking abandoned provider work to cancel cooperatively.
 @MainActor
 private final class RoutingRequestGate<Value> {
@@ -100,9 +128,13 @@ private final class RoutingRequestGate<Value> {
     private var worker: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private let context: RoutingRequestContext
+    private let cancellation: RoutingRequestCancellation
 
     /// Binds the gate to the request's deadline and content-free attempt observer.
-    init(context: RoutingRequestContext) { self.context = context }
+    init(context: RoutingRequestContext, cancellation: RoutingRequestCancellation) {
+        self.context = context
+        self.cancellation = cancellation
+    }
 
     /// Handles cancellation arriving before registration without starting provider work.
     func start(_ continuation: CheckedContinuation<RoutingActorValue<Value>, any Error>,
@@ -112,7 +144,7 @@ private final class RoutingRequestGate<Value> {
             return
         }
         self.continuation = continuation
-        worker = Task { @MainActor in
+        let worker = Task { @MainActor in
             do {
                 try context.checkActive()
                 let value = try await operation()
@@ -120,6 +152,8 @@ private final class RoutingRequestGate<Value> {
                 succeed(value)
             } catch { fail(error) }
         }
+        self.worker = worker
+        cancellation.register(worker)
         if let cutoff = context.cutoff {
             timer = Task { @MainActor in
                 do { try await Task.sleep(until: cutoff, clock: .continuous) }
@@ -138,6 +172,7 @@ private final class RoutingRequestGate<Value> {
         timer?.cancel()
         timer = nil
         worker = nil
+        cancellation.clear()
         let continuation = continuation
         self.continuation = nil
         continuation?.resume(returning: RoutingActorValue(value))
@@ -153,6 +188,7 @@ private final class RoutingRequestGate<Value> {
         worker?.cancel()
         timer = nil
         worker = nil
+        cancellation.clear()
         let continuation = continuation
         self.continuation = nil
         continuation?.resume(throwing: error)
@@ -165,13 +201,15 @@ enum RoutingRequestRunner {
     /// Races a monotonic deadline without task-group scope waiting on a noncooperative provider.
     static func run<Value>(context: RoutingRequestContext,
         operation: @escaping @MainActor () async throws -> Value) async throws -> Value {
-        let gate = RoutingRequestGate<Value>(context: context)
+        let cancellation = RoutingRequestCancellation()
+        let gate = RoutingRequestGate<Value>(context: context, cancellation: cancellation)
         let boxed = try await withTaskCancellationHandler {
             if Task.isCancelled { gate.fail(CancellationError()) }
             return try await withCheckedThrowingContinuation { continuation in
                 gate.start(continuation, operation: operation)
             }
         } onCancel: {
+            cancellation.cancel()
             Task { @MainActor in gate.fail(CancellationError()) }
         }
         try Task.checkCancellation()

@@ -134,6 +134,70 @@ final class RequestControlTests: XCTestCase {
         await provider.finished.wait()
     }
 
+    /// Caller cancellation inside a synchronous provider suppresses both its value and unavailable-result fallback.
+    func testCallerCancellationInsideProviderCannotTrainOrFallback() async throws {
+        for unavailable in [false, true] {
+            let router = router()
+            var request: Task<RoutingResult<String>, any Error>!
+            var events: [RoutingAttempt] = []
+            var localCalls = 0
+            request = Task {
+                try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192, deadline: .unlimited,
+                    onAttempt: { events.append($0) }, cloud: {
+                        request.cancel()
+                        return unavailable ? nil : "cancelled output"
+                    }, onDevice: { localCalls += 1; return "local" })
+            }
+            do { _ = try await request.value; XCTFail("Caller cancellation must propagate.") }
+            catch is CancellationError {}
+            XCTAssertEqual(events.map(\.outcome), [.cancelled])
+            XCTAssertEqual(localCalls, 0)
+            XCTAssertTrue(router.profile.samples.isEmpty)
+            XCTAssertTrue(router.profile.failures.isEmpty)
+        }
+    }
+
+    /// A retryable provider error after caller cancellation must not reach classification or another provider.
+    func testCallerCancellationBeforeProviderErrorCannotRetry() async throws {
+        let router = router()
+        var request: Task<RoutingResult<String>, any Error>!
+        var events: [RoutingAttempt] = []
+        var classifierCalls = 0
+        var localCalls = 0
+        request = Task {
+            try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192, deadline: .unlimited,
+                shouldFallback: { _, _ in classifierCalls += 1; return true }, onAttempt: { events.append($0) },
+                cloud: { request.cancel(); throw URLError(.timedOut) },
+                onDevice: { localCalls += 1; return "local" })
+        }
+        do { _ = try await request.value; XCTFail("Caller cancellation must propagate.") }
+        catch is CancellationError {}
+        XCTAssertEqual(events.map(\.outcome), [.cancelled])
+        XCTAssertEqual(classifierCalls, 0)
+        XCTAssertEqual(localCalls, 0)
+        XCTAssertTrue(router.profile.samples.isEmpty)
+        XCTAssertTrue(router.profile.failures.isEmpty)
+    }
+
+    /// A classifier may cancel its caller, which must suppress subsequent health training and fallback.
+    func testCallerCancellationDuringClassificationCannotRetry() async throws {
+        let router = router()
+        var request: Task<RoutingResult<String>, any Error>!
+        var events: [RoutingAttempt] = []
+        var localCalls = 0
+        request = Task {
+            try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192, deadline: .unlimited,
+                shouldFallback: { _, _ in request.cancel(); return true }, onAttempt: { events.append($0) },
+                cloud: { throw URLError(.timedOut) }, onDevice: { localCalls += 1; return "local" })
+        }
+        do { _ = try await request.value; XCTFail("Caller cancellation must propagate.") }
+        catch is CancellationError {}
+        XCTAssertEqual(events.map(\.outcome), [.failed])
+        XCTAssertEqual(localCalls, 0)
+        XCTAssertTrue(router.profile.samples.isEmpty)
+        XCTAssertTrue(router.profile.failures.isEmpty)
+    }
+
     /// Invalid deadlines fail before provider work, and generic app objects stay on the main actor.
     func testDeadlineValidationAndNonSendableOutput() async throws {
         let router = router()
