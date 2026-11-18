@@ -17,9 +17,10 @@ let task = Task { @MainActor in
     }
 }
 
-// Cancel this task when the view or request is no longer needed.
-task.cancel()
+try await task.value
 ```
+
+Keep the handle in the view model if the user can stop generation. Call `task.cancel()` from the Cancel action or when the view disappears.
 
 ## Recovery boundaries
 
@@ -29,7 +30,7 @@ An empty cloud stream is unavailable and may recover locally. An empty local str
 
 ## Bounded snapshots
 
-Streams start when created. Keep the consuming task so you can cancel it. The package buffers at most eight routing events and the native bridge buffers one cumulative SDK snapshot. Fast producers can coalesce intermediate updates or the initial selection event. A `.completed` event includes the final value, original decision, actual route and complete attempt diagnostics.
+Streams start when created. Keep the consuming task so you can cancel it. The package buffers at most eight routing events and the native bridge buffers one cumulative SDK snapshot. Fast producers can coalesce intermediate updates or the initial selection event. A `.completed` event includes the final value, original decision, actual route and foreground attempt diagnostics.
 
 Cancel the task consuming the stream to stop provider work; simply retaining an abandoned stream is not a cancellation API. The default request deadline also bounds waiting for stalled streams.
 

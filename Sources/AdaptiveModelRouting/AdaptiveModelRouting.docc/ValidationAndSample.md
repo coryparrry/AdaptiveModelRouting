@@ -22,4 +22,10 @@ swift run --package-path Demo RoutingDemo
 
 The macOS sample defaults to simulated providers, local-only routing and memory-only calibration. Run, cancel, inspect cumulative output, and expand Advanced to choose presets, deadlines, simulated cloud failures and profile controls. Model-level tests cover recovery before output, failure after partial output, deadline expiry, cancellation and storage reset.
 
-Apple-model mode is an explicit choice and still depends on your device, SDK and signing/entitlement setup. Automated validation and the checked sample flow use simulations; they do not qualify live model tokenization, native generation, PCC access or network handoff.
+Apple-model mode uses the device’s model and requires a supported configuration. PCC also requires the consuming app’s managed entitlement and signing.
+
+## Candidate qualification, 18 November 2026
+
+The release candidate at `656d8c0` passed all 11 validation stages with Xcode 27.2 (27B52), including 234 package tests each in Debug and Release and a cross-build targeting iOS 26. In a separate native macOS check, the Apple adapter tokenized two synthetic prompts and completed one buffered and one streaming request using `.localOnly`.
+
+Signed PCC generation in a consuming app, execution on a physical iPhone, and live network handoffs remain unverified for that revision.

@@ -4,7 +4,7 @@ Control learned timings without retaining inference content.
 
 ## Automatic paired learning
 
-Automatic routing initially answers from cloud while the same request also runs locally for timing calibration. With the default fastest preset, three completed comparable pairs normally provide enough evidence to select the faster suitable provider, with no minimum-saving threshold or variability penalty. Balanced and quality-first are optional cloud-favoring presets. Quality-first requires five observations per lane. Timings measure latency, not output quality; the app must decide which workloads allow either model.
+When both providers are eligible and lack timings, automatic routing initially selects cloud. It can run the same request locally to learn how the two providers compare. Use this policy for workloads where either model can produce an acceptable answer.
 
 Only the selected provider publishes text or streaming snapshots. The secondary provider runs concurrently, and its output is discarded after calibration unless a recoverable foreground failure needs that existing call for fallback. Foreground success does not wait for secondary completion. Secondary timings and outcomes appear in `lastCalibrationAttempt`, independently of foreground `attempts` and `onAttempt` callbacks.
 
@@ -21,6 +21,34 @@ print(router.isCalibrating)
 router.cancelCalibration()
 ```
 
+## Choose a preset
+
+Presets control how much faster local inference must be before the router prefers it. The absolute and percentage savings must both be met. The variability allowance accounts for the spread of recent timings on each provider.
+
+| Preset | Minimum samples per provider | Minimum local saving | Variability allowance |
+| --- | ---: | --- | ---: |
+| `.fastest` (default) | 3 | Any predicted advantage | 0 |
+| `.balanced` | 3 | 350 ms and 25% | 1 standard deviation |
+| `.latencyFirst` | 3 | 100 ms and 10% | 0.5 standard deviations |
+| `.qualityFirst` | 5 | 750 ms and 40% | 1.5 standard deviations |
+
+By default, observations are comparable when input and expected output sizes are within 25% and the provider’s session state matches (fresh or reused). An unspecified output size matches another unspecified size. The router keeps up to 128 timings per provider and uses up to six recent comparable observations for each default prediction. Cloud estimates use timings from the current connection. The device can reuse its local timings across networks.
+
+To change an individual setting while retaining the other preset values:
+
+```swift
+let configuration = RoutingConfiguration(
+    customizing: .qualityFirst,
+    localResponseReserve: 768,
+    failureBackoff: 120,
+    calibration: .paired(refreshEvery: 1, timeout: .seconds(30))
+)
+```
+
+## Refresh timing estimates
+
+The default local refresh age is 30 minutes. A recoverable failure triggers 60 seconds of health backoff by default. A pending cloud request can trigger backoff after 20 seconds, independently of the overall request deadline.
+
 After learning, each eligible cloud-selected request can recheck local inference by default. This adds device compute to reduce paid adaptation lag. Explicit paired refresh counts remain configurable; missing or stale comparable samples can probe sooner. Optional cloud probes also require at least `cloudRetryInterval` (600 seconds by default) since any cloud use, including failed, cancelled, timed-out and standalone measured calls. This cooldown is persisted before dispatch and survives disk-backed restarts and timing identity changes. Local probes need no cloud cooldown. Predictions weight elapsed measurement age with `predictionHalfLife` (300 seconds by default), in addition to recency rank. Rechecks run when requests arrive, without a separate repeating timer. A router owns at most one secondary call at a time. The secondary timeout is capped by the originating request's remaining deadline, including preflight. `waitForCalibration()` waits for the current probe's completion, timeout or cancellation. If a provider ignores cancellation, `isCalibrating` stays true and reserves the secondary slot until that provider actually exits. Discarded late results never train the profile.
 
 Cloud-required, local-only, offline, unavailable, oversized and provider-backoff conditions restrict secondary execution as well as foreground inference. Cancellation or foreground failure cancels its secondary call. Profile resets, storage transitions, connection changes and calibration-identity changes cancel optional probes and invalidate obsolete training. Once a secondary is being awaited as foreground recovery, unrelated requests and calibration cancellation preserve it; the originating request can still cancel its own work.
@@ -29,6 +57,8 @@ Apple quota and rate-limit errors with an explicit reset date block router-manag
 
 Paired requests spend additional device compute and cloud quota, and the measured speed includes concurrent inference conditions. Use `calibration: .singleProvider` for providers whose calls can commit external side effects, or to retain the original one-provider exploration behavior. That mode periodically returns local calibration answers as part of normal traffic.
 
+## Startup and connection changes
+
 For a newly monitored owner, optional paid cloud probes wait for an admitted live local result and an accepted initial connection observation. A newer explicit known connection can supply that state when it supersedes a queued native callback; unknown or stale observations cannot. This startup guard does not delay foreground inference, required cloud work, local shadow work or recovery. Deferred requests do not consume probe cadence or record cloud use. There is no settling timer; later eligible app requests continue calibration after readiness is established.
 
 When local has enough comparable timings but cloud does not, paired mode serves local with `insufficientEvidence` and a local estimate only, until a successful current cloud observation beats both the qualified local prediction and its latest comparable observation. That observation permits one foreground cloud learning attempt, still reported as `insufficientEvidence` without a qualified cloud estimate. A newly admitted successful result can permit the next request until the configured minimum is reached. With default settings this normally needs one due PCC probe and up to two successful foreground learning calls, rather than three spaced probes.
@@ -36,6 +66,8 @@ When local has enough comparable timings but cloud does not, paired mode serves 
 The router consumes and persists that permission before yielding or emitting selection callbacks. Failed, cancelled, timed-out, unavailable and invalidated work cannot reuse it. Optional PCC probes retain the 600-second cooldown, including conservative foreground-learning reservations that never reach provider dispatch. A slower cloud observation keeps requests local and learning paced. Pure previews consume no permission. These guarantees apply to one retained router owner and its ordinary disk-backed relaunch; multiple independent owners sharing a cache do not coordinate admission.
 
 Equal native paths retain history. Every unequal native state advances request generation and rejects obsolete in-flight cloud observations. Observable route, connectivity, capability and cost changes invalidate matching cloud timings; opaque inequalities and link-quality-only reassessments retain historical predictions as priors. They are revalidated by subsequent successful cloud work or the next eligible paid probe. An unexposed genuine network change can therefore retain an older prediction until revalidation; public fields cannot prove transport equivalence. Explicit app invalidation still clears matching history. Further changes, sparse traffic, failures, clock adjustments and quota pressure can delay qualification. Observations must remain comparable and fit within `sampleLifetime`. Hard policies, provider availability, context limits, failure recovery and single-provider exploration retain precedence. Exploration based on partial evidence is not a qualified prediction that cloud will be fastest on the next request.
+
+## Switching between providers
 
 With the default zero-margin, zero-variability configuration, a newly faster local observation can also permit foreground local learning while older weighted timings still favor cloud. These decisions use `localCalibration` and retain the qualified estimates: this is explicit exploration, not a claim that the weighted local prediction has already won. Permission is consumed and persisted before callbacks or suspension; only a successful admitted local result can reopen it. Failed, cancelled and timed-out attempts cannot replay the observation. This accelerates cloud-to-local adaptation without spending additional PCC calls or changing its cooldown. Balanced, quality-first, latency-first and other nonzero-margin/variability configurations retain their existing comparison policy.
 
@@ -65,7 +97,7 @@ try router.resetProfile()
 try router.setPersistence(.memoryOnly)
 ```
 
-Memory-only initialization never loads or writes a calibration file. Switching to memory-only storage removes the owned file by default; pass `clearExistingCache: false` to preserve it explicitly. Reenabling disk preserves unreadable or unsupported caches rather than overwriting them. An explicit reset clears learned timings and removes the owned metadata file when disk mode is active. The current owner retains its in-memory cloud-use cooldown; explicit cache removal means a later new owner cannot restore that timestamp.
+Memory-only initialization never loads or writes a calibration file. Switching to memory-only storage removes the owned file by default; pass `clearExistingCache: false` to preserve it explicitly. Reenabling disk preserves unreadable or unsupported caches rather than overwriting them. An explicit reset clears learned timings. In disk mode it replaces the cache with pacing metadata if a server retry deadline is active. Otherwise it removes the owned metadata file. The current owner retains its in-memory cloud-use cooldown; explicit cache removal means a later new owner cannot restore that timestamp.
 
 Reset rejects a directory at the reserved `latency.json` path and preserves its contents. It also preserves unrelated sibling files. Requests already in flight can still return their outputs, but their old measurements cannot repopulate a reset profile.
 
