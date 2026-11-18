@@ -1,8 +1,11 @@
 # AdaptiveModelRouting
 
-A Swift package that learns when to use an on-device model or a preferred cloud model such as Private Cloud Compute.
+AdaptiveModelRouting is a Swift package for iOS and macOS that routes language model requests between an on-device model and a cloud model such as Apple’s Private Cloud Compute. When either model can do the job, it learns from response times on the device and chooses the provider it expects to answer faster for the request size and current connection.
 
-It starts cloud-first, measures both models on a few real requests, and chooses the model with the lowest predicted latency once calibrated. It continues sampling the alternative model as the app is used. One product and one import provide the Apple adapter, routing presets and detailed results. Apps can also supply their own inference closures.
+- **Control where each prompt goes.** Use `.localOnly` to keep a sensitive request on the device, `.cloudRequired` for a task that needs the cloud model, or `.automatic` to let the router choose. By default, automatic calibration can send the same prompt to both providers.
+- **Handle temporary failures and quota limits.** The router respects provider retry deadlines, spaces out optional cloud calls, and can fall back when policy permits. Once streaming output reaches the caller, the response stays with that provider.
+- **Use one API for text, structured output, and streaming.** The Apple Foundation Models adapter supports all three. Apps with their own inference providers can supply Swift closures to the core router.
+- **See why a request went local or cloud.** Detailed results report the selection reason, which provider answered, and how long each attempt took. Calibration stays on the device and stores no prompts or generated responses.
 
 Build with an **iOS/macOS 27 SDK**; validation currently uses Xcode 27.3. Core routing APIs support **iOS 26+** and **macOS 26+**. The Apple adapter requires an **iOS/macOS 27 runtime**. The package uses Apple's Foundation, Network, Foundation Models and CryptoKit frameworks, with no third-party dependencies.
 
