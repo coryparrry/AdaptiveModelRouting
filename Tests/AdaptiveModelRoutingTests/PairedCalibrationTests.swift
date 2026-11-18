@@ -6,10 +6,11 @@ import XCTest
 @MainActor
 final class PairedCalibrationTests: XCTestCase {
     /// Uses short real operations, a bounded probe and caller-controlled sample/cadence requirements.
-    private func router(minimum: Int = 3, every: Int = 10, timeout: Duration = .seconds(2)) -> AdaptiveRouter {
+    private func router(minimum: Int = 3, every: Int = 10, timeout: Duration = .seconds(2),
+        cloudRetryInterval: TimeInterval = 0.001) -> AdaptiveRouter {
         AdaptiveRouter(monitorConnection: false,
             configuration: .init(minimumLocalSavingSeconds: 0.001, minimumLocalSavingFraction: 0.1,
-                minimumSamples: minimum, cloudRetryInterval: 0.001, variabilityAllowance: 0,
+                minimumSamples: minimum, cloudRetryInterval: cloudRetryInterval, variabilityAllowance: 0,
                 calibration: .paired(refreshEvery: every, timeout: timeout)), persistence: .memoryOnly)
     }
 
@@ -30,7 +31,7 @@ final class PairedCalibrationTests: XCTestCase {
 
     /// Learns both lanes from three real requests while returning cloud until the evidence is sufficient.
     func testColdStartLearnsBothLanesFromThreeRequests() async throws {
-        let router = router()
+        let router = router(cloudRetryInterval: RoutingConfiguration.fastest.cloudRetryInterval)
         var localCalls = 0
         for index in 1...3 {
             let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
