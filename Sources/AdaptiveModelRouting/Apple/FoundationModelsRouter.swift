@@ -82,6 +82,7 @@ public final class FoundationModelsRouter {
 
     /// Maps explicit Apple transport, quota and service failures while preserving refusals and invalid requests.
     public static func isRetryable(_ error: any Error) -> Bool {
+        if let error = error as? SystemLanguageModel.Error, case .assetsUnavailable = error { return true }
         if let error = error as? PrivateCloudComputeLanguageModel.Error {
             switch error {
             case .networkFailure, .quotaLimitReached, .serviceUnavailable: return true
@@ -136,7 +137,7 @@ public final class FoundationModelsRouter {
     ) async throws -> RoutingResult<Value> {
         try await router.withRequest(deadline: deadline, onAttempt: onAttempt) { context in
             let prepared = try await self.prepare(prompt: prompt, schema: schema, policy: policy, context: context)
-            return try await self.router.performDetailed(context: context, inputTokens: prepared.tokens,
+            let result = try await self.router.performDetailed(context: context, inputTokens: prepared.tokens,
                 localContextCapacity: prepared.capacity, policy: policy,
                 workload: .init(expectedOutputTokens: prepared.options.maximumResponseTokens), availability: prepared.availability, calibrationIdentifier: prepared.identity,
                 shouldFallback: { self.shouldFallback($0, $1) },
@@ -144,6 +145,7 @@ public final class FoundationModelsRouter {
                 localPermission: { self.backend.availability(for: .localOnly).onDevice },
                 cloud: { _, _ in try await generate(.cloud, prepared.options) },
                 onDevice: { _, _ in try await generate(.onDevice, prepared.options) })
+            return try prepared.resolve(result)
         }
     }
 
@@ -158,9 +160,25 @@ public final class FoundationModelsRouter {
         return current.cloud && (!calibration || current.permitsCloudCalibration)
     }
 
+    /// Carries preflight eligibility and any local failure forward to the final dispatch decision.
+    struct PreparedRequest {
+        let tokens: Int
+        let capacity: Int
+        let availability: RoutingAvailability
+        let options: GenerationOptions
+        let identity: String
+        let tokenizationError: (any Error)?
+
+        /// Restores the tokenizer failure if the cloud fallback lost permission before it could run.
+        func resolve<Value>(_ result: RoutingResult<Value>) throws -> RoutingResult<Value> {
+            if result.attempts.isEmpty, let tokenizationError { throw tokenizationError }
+            return result
+        }
+    }
+
     /// Accounts for local context only when permitted; tokenization failures cannot outlive the request.
     func prepare(prompt: String, schema: GenerationSchema?, policy: RoutingPolicy, context: RoutingRequestContext)
-        async throws -> (tokens: Int, capacity: Int, availability: RoutingAvailability, options: GenerationOptions, identity: String) {
+        async throws -> PreparedRequest {
         try context.checkActive()
         var options = options
         let limit = options.maximumResponseTokens ?? router.configuration.localResponseReserve
@@ -176,6 +194,7 @@ public final class FoundationModelsRouter {
         ])
         var availability = self.availability(for: policy)
         var tokens = 0
+        var tokenizationError: (any Error)?
         if availability.onDevice {
             do { tokens = try await backend.inputTokens(prompt: prompt, instructions: instructions, schema: schema) }
             catch is CancellationError { throw CancellationError() }
@@ -185,6 +204,7 @@ public final class FoundationModelsRouter {
                 let retry = current.cloud && shouldFallback(.onDevice, error)
                 try context.checkActive()
                 guard retry else { throw error }
+                tokenizationError = error
                 availability = .init(onDevice: false, cloud: current.cloud, cloudQuota: current.cloudQuota)
             }
             let current = self.availability(for: policy)
@@ -192,6 +212,7 @@ public final class FoundationModelsRouter {
                 cloud: current.cloud, cloudQuota: current.cloudQuota)
         }
         try context.checkActive()
-        return (tokens, availability.onDevice ? backend.localContextCapacity : 0, availability, options, identity)
+        return PreparedRequest(tokens: tokens, capacity: availability.onDevice ? backend.localContextCapacity : 0,
+            availability: availability, options: options, identity: identity, tokenizationError: tokenizationError)
     }
 }

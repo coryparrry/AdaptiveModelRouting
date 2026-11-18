@@ -52,7 +52,7 @@ public final class AdaptiveRouter {
     private enum CacheAccess {
         case writable
         case preserved
-        case awaitingRead(restoreProfile: Bool)
+        case awaitingRead(PerformanceProfile.CacheRecovery?)
     }
     private var cacheAccess: CacheAccess = .writable
     private let calibration: RoutingCalibrationCoordinator
@@ -75,7 +75,7 @@ public final class AdaptiveRouter {
         self.monitor = monitorConnection ? NWPathMonitor() : nil
         self.calibration = RoutingCalibrationCoordinator(awaitStartupObservations: monitorConnection)
         if persistence == .memoryOnly { storageStatus = .memoryOnly }
-        else { try? loadCache(restoreProfile: true) }
+        else { try? loadCache(restoring: .init()) }
         monitor?.pathUpdateHandler = { [weak self] path in
             let observedAt = ContinuousClock.now
             Task { @MainActor [weak self] in self?.receiveNativePath(path, observedAt: observedAt) }
@@ -265,28 +265,25 @@ public final class AdaptiveRouter {
         let value: Value? = try await InferenceExecutor.execute(preferred: decision.route,
             canUseLocalWhole: fits && availability.onDevice, policy: policy, canFallback: canFallback,
             shouldFallback: { classify($0, $1, context) }, cloud: {
-                guard availability.cloud else { return nil }
-                if let probe, probe.route == .cloud {
-                    let value = try await consumeProbe(probe, context: context, onValue: onProbeFallback)
-                    if value != nil || !probe.context.attempts.isEmpty { return value }
-                    // An optional worker that declined before dispatch leaves the foreground call available.
-                }
-                guard cloudPermission(false) else { return nil }
-                return try await track(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
+                guard availability.cloud else { return .skipped }
+                if let probe, probe.route == .cloud,
+                   let outcome = try await consumeProbe(probe, context: context, onValue: onProbeFallback) { return outcome }
+                guard cloudPermission(false) else { return .skipped }
+                let value = try await track(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
                     workload: workload, context: context, comparisonID: comparisonID, available: { $0 != nil }) {
                         self.calibration.recordCloudUse()
                         self.save()
                         try context.checkActive()
                         return try await cloud(context, false)
                     }
+                return .returned(value)
             }, onDevice: {
-                if let probe, probe.route == .onDevice {
-                    let value = try await consumeProbe(probe, context: context, onValue: onProbeFallback)
-                    if value != nil || !probe.context.attempts.isEmpty { return value }
-                }
-                guard localPermission() else { return nil }
-                return try await track(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
+                if let probe, probe.route == .onDevice,
+                   let outcome = try await consumeProbe(probe, context: context, onValue: onProbeFallback) { return outcome }
+                guard localPermission() else { return .skipped }
+                let value = try await track(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
                     workload: workload, context: context, comparisonID: comparisonID, available: { _ in true }) { try await onDevice(context, false) }
+                return .returned(value)
             })
         let status: RoutingResultStatus = value != nil ? .completed
             : (policy != .cloudRequired && availability.onDevice && !fits ? .requiresChunking : .unavailable)
@@ -297,16 +294,22 @@ public final class AdaptiveRouter {
     /// Reuses an already running secondary call during fallback without training its timing twice.
     private func consumeProbe<Value>(_ probe: RoutingProbe<Value>, context: RoutingRequestContext,
         onValue: ((Value, InferenceRoute) throws -> Void)?
-    ) async throws -> Value? {
+    ) async throws -> RoutingDispatch<Value>? {
+        try context.checkActive()
+        // An explicit invalidation can carry newer quota or model information than this request has.
+        if probe.task.isCancelled { return .skipped }
         try context.begin(probe.route)
         probe.promoteToForeground()
         do {
             let value = try await probe.task.value.value
             try context.checkActive()
             if let value { try onValue?(value, probe.route) }
-            if value == nil && probe.context.attempts.isEmpty { context.discardUndispatchedAttempt() }
-            else { context.finishAttempt(value == nil ? .unavailable : .succeeded) }
-            return value
+            if value == nil && probe.context.attempts.isEmpty {
+                context.discardUndispatchedAttempt()
+                return nil
+            }
+            context.finishAttempt(value == nil ? .unavailable : .succeeded)
+            return .returned(value)
         } catch {
             let error = context.effectiveError(error)
             context.finishAttempt((error as? RoutingRequestError) == .deadlineExceeded ? .timedOut
@@ -373,7 +376,10 @@ public final class AdaptiveRouter {
         if disposition != .stale { lastPathUpdate = observedAt }
         if disposition == .applied {
             calibration.cancel()
-            if discardHistory { profile.changedConnection(value) }
+            if discardHistory {
+                profile.changedConnection(value)
+                if case let .awaitingRead(recovery) = cacheAccess { recovery?.invalidate(value) }
+            }
             connection = value
             generation += 1
             save()
@@ -440,6 +446,9 @@ public final class AdaptiveRouter {
                         profile.record(model: model, tokens: inputTokens, seconds: seconds,
                             connection: snapshot.connection, now: .now, workload: workload, configuration: configuration,
                             comparisonID: comparisonID)
+                        if case let .awaitingRead(recovery) = cacheAccess, inputTokens >= 0, seconds > 0 {
+                            recovery?.recordSuccess(model, connection: snapshot.connection)
+                        }
                         if model == .onDevice && inputTokens > 0 && seconds > 0 {
                             calibration.recordLocalObservation()
                         }
@@ -501,7 +510,7 @@ public final class AdaptiveRouter {
 
     /// Loads a known format, preserving malformed or future files until an explicit reset.
     /// Temporary filesystem errors leave the owner able to retry without replacing unread pacing metadata.
-    private func loadCache(restoreProfile: Bool) throws {
+    private func loadCache(restoring recovery: PerformanceProfile.CacheRecovery?) throws {
         do {
             let cache = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: file))
             guard cache.version == 1 else {
@@ -512,12 +521,15 @@ public final class AdaptiveRouter {
             cacheAccess = .writable
             mergeCloudPacing(from: cache)
             storageStatus = .notPersisted
-            if restoreProfile {
-                lastLocalLearning = cache.lastLocalLearning
+            if let recovery {
+                if let storedLearning = cache.lastLocalLearning {
+                    lastLocalLearning = max(lastLocalLearning ?? storedLearning, storedLearning)
+                }
                 if cache.system == system && (identity == nil || cache.identity == identity) {
-                    profile = cache.profile
+                    let changed = recovery.hasChanges || !profile.samples.isEmpty || !profile.failures.isEmpty
+                    profile.restorePrior(cache.profile, recovery: recovery, configuration: configuration)
                     identity = cache.identity
-                    storageStatus = .persisted
+                    storageStatus = changed ? .notPersisted : .persisted
                 }
             }
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
@@ -529,17 +541,16 @@ public final class AdaptiveRouter {
                 storageStatus = .preservedCache
                 return
             }
-            cacheAccess = .awaitingRead(restoreProfile: restoreProfile)
+            cacheAccess = .awaitingRead(recovery)
             storageStatus = .unavailable
             throw error
         }
     }
 
-    /// Restores the previous timings only while the owner is pristine; later reads merge pacing into live state.
+    /// Reconciles matching history with observations made while the file was locked, or restores pacing alone.
     private func retryPendingCacheRead() throws {
-        guard case let .awaitingRead(restoreProfile) = cacheAccess else { return }
-        let pristine = profileGeneration == 0 && generation == 0 && profile.samples.isEmpty && profile.failures.isEmpty
-        try loadCache(restoreProfile: restoreProfile && pristine)
+        guard case let .awaitingRead(recovery) = cacheAccess else { return }
+        try loadCache(restoring: recovery)
     }
 
     /// Clears learned timings while preserving any active provider retry deadline and its pacing metadata.
@@ -554,6 +565,8 @@ public final class AdaptiveRouter {
                 storageStatus = .notPersisted
             }
             cacheAccess = .writable
+        } else if case .awaitingRead = cacheAccess {
+            cacheAccess = .awaitingRead(nil)
         }
         calibration.cancel()
         profileGeneration += 1
@@ -563,7 +576,11 @@ public final class AdaptiveRouter {
     /// Changes storage policy; disabling disk storage clears the owned cache by default.
     public func setPersistence(_ value: RoutingPersistence, clearExistingCache: Bool = true) throws {
         if value == .disk {
-            try? loadCache(restoreProfile: false)
+            if persistence == .disk, case .awaitingRead = cacheAccess {
+                try? retryPendingCacheRead()
+            } else {
+                try? loadCache(restoring: nil)
+            }
         } else if clearExistingCache {
             // Explicit deletion must retain unread pacing even after a prior, non-clearing detach.
             defer { if persistence == .memoryOnly { storageStatus = .memoryOnly } }
@@ -582,6 +599,12 @@ public final class AdaptiveRouter {
     public func updateCalibrationIdentifier(_ value: String?) {
         let next = value.map { RoutingFingerprint.make([$0]) }
         guard next != identity else { return }
+        // The first Apple preflight can identify this workload before its cache becomes readable.
+        // A subsequent identity change explicitly abandons the old workload's saved timings.
+        if case let .awaitingRead(recovery) = cacheAccess {
+            if identity == nil { recovery?.clearWorkloadHealth() }
+            else { cacheAccess = .awaitingRead(nil) }
+        }
         calibration.cancel()
         identity = next
         profileGeneration += 1

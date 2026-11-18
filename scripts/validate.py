@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -80,6 +81,18 @@ def main() -> None:
     args = parser.parse_args()
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
+    # Keep a stable lock inode across runs. Closing the descriptor also releases it after interruption.
+    with (artifacts / ".validation.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"Waiting for active validation in {artifacts}", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        run_validation(args, artifacts)
+
+
+def run_validation(args: argparse.Namespace, artifacts: Path) -> None:
+    """Publish the complete run while holding exclusive use of its evidence directory."""
     results = []
     write_summary(artifacts, results, "running")
     try:

@@ -1,4 +1,6 @@
 import Foundation
+import FoundationModels
+import Observation
 import XCTest
 @testable import RoutingDemoSupport
 
@@ -150,18 +152,72 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(reopened.storageLabel, "In memory")
     }
 
-    /// Seeds qualified simulated local timings, then leaves a cloud probe stalled after the local answer returns.
-    private func finishForegroundWithRunningProbe(_ model: DemoModel) async {
+    /// Editing the next request's deadline keeps learned timings and the active provider-wide retry date.
+    func testDeadlineEditPreservesInMemoryTimingsAndCloudThrottle() async throws {
+        let (model, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        model.start()
+        await model.waitUntilFinished()
+        let router = model.activeRouter
+        do {
+            let _: String? = try await router.respond(inputTokens: 10, localContextCapacity: 8_192, policy: .cloudRequired,
+                cloud: { throw LanguageModelError.rateLimited(.init(resetDate: .now.addingTimeInterval(3_600), debugDescription: "fixture")) },
+                onDevice: { XCTFail("Cloud required"); return "unexpected" })
+            XCTFail("Expected the provider throttle")
+        } catch LanguageModelError.rateLimited {}
+
+        model.deadlineSeconds = 1
+        XCTAssertTrue(model.activeRouter === router)
+        XCTAssertEqual(model.activeRouter.profile.samples.count, 1)
+        model.policy = .cloud
+        model.start()
+        await model.waitUntilFinished()
+        XCTAssertEqual(model.status, "No permitted model is available")
+        XCTAssertTrue(model.attempts.isEmpty)
+    }
+
+    /// Seeds qualified simulated local timings, then returns while the slower cloud probe is active.
+    private func finishForegroundWithRunningProbe(_ model: DemoModel, fault: DemoFault = .stall) async {
         for _ in 0..<3 {
             model.start()
             await model.waitUntilFinished()
         }
         model.policy = .automatic
-        model.fault = .stall
+        model.fault = fault
         model.start()
         await model.waitUntilFinished()
         XCTAssertEqual(model.status, "Completed on device")
         XCTAssertTrue(model.activeRouter.isCalibrating)
+    }
+
+    /// The same action as the view's Cancel button can stop a probe after the visible answer completes.
+    func testCancelRemainsAvailableForPostResponseCalibration() async {
+        let (model, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await finishForegroundWithRunningProbe(model)
+        XCTAssertFalse(model.isRunning)
+        XCTAssertTrue(model.canCancel)
+        model.cancel()
+        XCTAssertFalse(model.canCancel)
+        await model.activeRouter.waitForCalibration()
+        XCTAssertEqual(model.activeRouter.lastCalibrationAttempt?.outcome, .cancelled)
+        XCTAssertEqual(model.status, "Completed on device")
+    }
+
+    /// Completing a healthy late probe updates observed controls and displays the extra timing automatically.
+    func testCompletedCalibrationRefreshesDisplayedTimingCount() async {
+        let (model, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await finishForegroundWithRunningProbe(model, fault: .none)
+        let foregroundSamples = model.sampleCount
+        let changed = XCTestExpectation(description: "Cancel availability changed")
+        let canCancel = withObservationTracking { model.canCancel } onChange: { changed.fulfill() }
+        XCTAssertTrue(canCancel)
+        let outcome = await XCTWaiter.fulfillment(of: [changed], timeout: 5)
+        XCTAssertEqual(outcome, .completed)
+        XCTAssertFalse(model.canCancel)
+        XCTAssertEqual(model.sampleCount, foregroundSamples + 1)
+        XCTAssertEqual(model.activeRouter.lastCalibrationAttempt?.outcome, .succeeded)
     }
 
     /// Changing a preset cancels the old background probe and prevents late work overwriting the new owner's file.

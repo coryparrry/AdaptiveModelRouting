@@ -11,7 +11,7 @@ git diff --check
 
 The validation command runs the package's debug/release tests, external one-import consumer, sample model tests, iOS cross-compilation and DocC conversion. It keeps full logs and `summary.json` under `.build/validation`; inspect those logs for failures instead of repeatedly rerunning unchanged conditions. CI uses the same command on the official `xcode-27` runner image and uploads the evidence and DocC archive.
 
-Each run replaces the previous summary when it starts. The last entry reports `running`, `failed` or `interrupted` until validation succeeds. A successful summary contains only completed stages with exit code zero.
+Runs using the same evidence directory wait for one another. Each run replaces the previous summary when it starts. The last entry reports `running`, `failed` or `interrupted` until validation succeeds. A successful summary contains only completed stages with exit code zero.
 
 Artifact upload is best-effort: storage quota failures do not change the validation result. Stage results and bounded failure details remain in the job log.
 The DocC archive is zipped before upload because its generated symbol filenames can contain colons that GitHub artifacts reject.

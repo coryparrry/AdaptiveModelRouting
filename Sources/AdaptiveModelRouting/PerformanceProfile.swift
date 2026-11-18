@@ -136,8 +136,8 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
             return .init(route: .onDevice, reason: .localCalibration,
                 localEstimate: localEstimate, cloudEstimate: cloudEstimate)
         }
-        if !useLocal, needsLocalConfirmation(localSamples: localSamples, cloudSamples: cloudSamples,
-            configuration: configuration, workload: workload) {
+        if !useLocal, needsLocalConfirmation(localSamples: localSamples, latestCloud: cloudSamples.first,
+            tokens: inputTokens, workload: workload, connection: connection, now: now, configuration: configuration) {
             return .init(route: .onDevice, reason: .localCalibration,
                 localEstimate: localEstimate, cloudEstimate: cloudEstimate)
         }
@@ -146,21 +146,24 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
     }
 
     /// Confirms a paid promotion when recent matched comparisons disagree with a local latency spike.
-    private func needsLocalConfirmation(localSamples: [Sample], cloudSamples: [Sample],
-        configuration: RoutingConfiguration, workload: RoutingWorkload
+    private func needsLocalConfirmation(localSamples: [Sample], latestCloud: Sample?, tokens: Int,
+        workload: RoutingWorkload, connection: Connection, now: Date, configuration: RoutingConfiguration
     ) -> Bool {
         guard configuration.conserveCloudQuota, case .paired = configuration.calibration,
               configuration.minimumLocalSavingSeconds == 0, configuration.minimumLocalSavingFraction == 0,
               configuration.variabilityAllowance == 0, !localSamples.isEmpty,
-              let cloud = cloudSamples.first else { return false }
-        let comparisons = cloudSamples.filter { sample in
+              let cloud = latestCloud else { return false }
+        let recent = localSamples.prefix(configuration.minimumSamples)
+        if recent.count == configuration.minimumSamples && recent.allSatisfy({ $0.seconds > cloud.seconds }) {
+            return false
+        }
+        let comparisons = comparable(.cloud, tokens: tokens, workload: workload, connection: connection,
+            now: now, configuration: configuration, limit: 2) { sample in
             sample.comparisonID != nil && sample.localComparisonSeconds.map { $0.isFinite && $0 > 0 } == true
                 && workload.isComparable(to: sample.workload ?? .init(), model: .onDevice,
                     tolerance: configuration.sizeTolerance)
-        }.prefix(2)
-        guard comparisons.contains(where: { $0.localComparisonSeconds! < $0.seconds }) else { return false }
-        let recent = localSamples.prefix(configuration.minimumSamples)
-        return recent.count < configuration.minimumSamples || !recent.allSatisfy { $0.seconds > cloud.seconds }
+        }
+        return comparisons.contains { $0.localComparisonSeconds! < $0.seconds }
     }
 
     /// Returns nil for ineligible requests, true for missing/stale evidence and false for cadence-only probes.
@@ -211,6 +214,11 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
         if model == .onDevice, let matched { samples[matched].localComparisonSeconds = seconds }
         samples.append(Sample(model: model, tokens: tokens, seconds: seconds, connection: connection,
             date: now, workload: workload, comparisonID: comparisonID, localComparisonSeconds: localSeconds))
+        trimSamples(for: model)
+    }
+
+    /// Enforces the per-provider limit without changing relative order or a sample's paired metadata.
+    private mutating func trimSamples(for model: InferenceRoute) {
         var excess = samples.lazy.filter { $0.model == model }.count - 128
         samples.removeAll { sample in
             guard excess > 0, sample.model == model else { return false }
@@ -237,6 +245,53 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
         failures.removeAll { $0.model == .cloud && $0.connection == connection }
     }
 
+    /// Tracks invalidations whose older samples or failures are still inside a temporarily inaccessible cache.
+    final class CacheRecovery {
+        private(set) var invalidatedPaths: [Connection] = []
+        private var recoveredCloudPaths: [Connection] = []
+        private var recoveredLocal = false
+
+        /// Records each materially changed cloud path at most once until its history can be read.
+        func invalidate(_ connection: Connection) {
+            if !invalidatedPaths.contains(connection) { invalidatedPaths.append(connection) }
+        }
+
+        /// Remembers cleared health even when a successful call had no tokens eligible for timing.
+        func recordSuccess(_ model: InferenceRoute, connection: Connection) {
+            if model == .onDevice { recoveredLocal = true }
+            else if !recoveredCloudPaths.contains(connection) { recoveredCloudPaths.append(connection) }
+        }
+
+        /// Selecting the first explicit model discards health learned from the previous anonymous workload.
+        func clearWorkloadHealth() {
+            recoveredLocal = false
+            recoveredCloudPaths.removeAll()
+        }
+
+        /// Distinguishes a pristine restore from newer changes that still need a successful save.
+        var hasChanges: Bool { recoveredLocal || !recoveredCloudPaths.isEmpty || !invalidatedPaths.isEmpty }
+
+        /// Prevents old failures from superseding a success on the same provider since startup.
+        func cleared(_ failure: Failure) -> Bool {
+            failure.model == .onDevice ? recoveredLocal : recoveredCloudPaths.contains(failure.connection)
+        }
+    }
+
+    /// Restores saved history underneath live observations, retaining matched pairs and newer health outcomes.
+    mutating func restorePrior(_ saved: Self, recovery: CacheRecovery, configuration: RoutingConfiguration) {
+        var combined = saved
+        for connection in recovery.invalidatedPaths { combined.changedConnection(connection) }
+        combined.failures.removeAll(where: recovery.cleared)
+        combined.samples.append(contentsOf: samples)
+        combined.trimSamples(for: .onDevice)
+        combined.trimSamples(for: .cloud)
+        for failure in failures {
+            combined.recordFailure(model: failure.model, connection: failure.connection,
+                now: failure.date, configuration: configuration)
+        }
+        self = combined
+    }
+
     /// Estimates weighted latency and spread; configured presets decide whether spread affects selection.
     private func estimate(
         _ samples: [Sample], configuration: RoutingConfiguration
@@ -258,18 +313,18 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
     /// Finds only recent, similarly sized observations, newest first.
     private func comparable(
         _ model: InferenceRoute, tokens: Int, workload: RoutingWorkload, connection: Connection, now: Date,
-        configuration: RoutingConfiguration
+        configuration: RoutingConfiguration, limit: Int? = nil, including: (Sample) -> Bool = { _ in true }
     ) -> [Sample] {
         guard tokens > 0 else { return [] }
         /// Applies the same size, session, age and path contract to both bounded and full-window selection.
         func matches(_ sample: Sample) -> Bool {
             let age = now.timeIntervalSince(sample.date)
             let ratio = Double(sample.tokens) / Double(tokens)
-            return sample.model == model && (model == .onDevice || sample.connection == connection)
+            return sample.model == model && including(sample) && (model == .onDevice || sample.connection == connection)
                 && workload.isComparable(to: sample.workload ?? .init(), model: model, tolerance: configuration.sizeTolerance)
                 && age >= 0 && age <= configuration.sampleLifetime && ((1 - configuration.sizeTolerance)...(1 + configuration.sizeTolerance)).contains(ratio)
         }
-        let limit = configuration.predictionSampleLimit
+        let limit = limit ?? configuration.predictionSampleLimit
         if limit > 16 { return Array(samples.filter(matches).sorted { $0.date > $1.date }.prefix(limit)) }
         var nearby: [(index: Int, sample: Sample)] = []
         nearby.reserveCapacity(limit)

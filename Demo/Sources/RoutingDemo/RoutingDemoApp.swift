@@ -74,7 +74,7 @@ struct RoutingDemoView: View {
                         .accessibilityIdentifier("run")
                     Button("Cancel") { model.cancel() }
                         .keyboardShortcut(.cancelAction)
-                        .disabled(!model.isRunning)
+                        .disabled(!model.canCancel)
                         .accessibilityIdentifier("cancel")
                     if model.isRunning { ProgressView().controlSize(.small).accessibilityLabel("Generating") }
                     Spacer()

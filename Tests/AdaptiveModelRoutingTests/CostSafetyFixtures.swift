@@ -79,7 +79,7 @@ struct CostScenario {
             if local == .success { return "value.onDevice" }
             if local == .cancelled { return "cancelled" }
             if local == .permanent || policy == .localOnly { return "\(local.rawValue).onDevice" }
-            return cloudReady ? terminal(cloud, route: .cloud) : "none"
+            return cloudReady ? terminal(cloud, route: .cloud) : "transient.onDevice"
         }
         if cloud == .success { return "value.cloud" }
         if cloud == .cancelled { return "cancelled" }

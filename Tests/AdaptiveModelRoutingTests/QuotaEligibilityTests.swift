@@ -180,6 +180,32 @@ final class QuotaEligibilityTests: XCTestCase {
         }
     }
 
+    /// A fresh quota warning retires a queued cloud probe before its originating request needs fallback.
+    func testExhaustionBeforeProbeStartsCannotRedispatchFromStaleSnapshot() async throws {
+        let profiles = try CostProfiles(cloudAge: 601)
+        defer { profiles.cleanup() }
+        let scenario = CostScenario(policy: .automatic, paired: true, training: .localFaster,
+            localReady: true, cloudReady: true, offline: false, capacity: 8_192, cloud: .success, local: .success)
+        let router = try profiles.router(scenario)
+        var cloudCalls = 0
+        do {
+            let _: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                workload: profiles.workload, cloud: { cloudCalls += 1; return "unexpected" }, onDevice: {
+                    XCTAssertTrue(router.isCalibrating)
+                    let next = try RoutingRequestContext(deadline: .unlimited, observer: nil)
+                    _ = try await router.performDetailed(context: next, inputTokens: 100, localContextCapacity: 8_192,
+                        policy: .localOnly, workload: profiles.workload, availability: .init(cloudQuota: .exhausted),
+                        shouldFallback: { _, _ in false }, cloud: { _, _ in cloudCalls += 1; return "unexpected" },
+                        onDevice: { _, _ in "private" })
+                    throw URLError(.networkConnectionLost)
+                })
+            XCTFail("The retired probe cannot recover the local failure.")
+        } catch let error as URLError { XCTAssertEqual(error.code, .networkConnectionLost) }
+        await router.waitForCalibration()
+        XCTAssertNil(router.lastCalibrationAttempt)
+        XCTAssertEqual(cloudCalls, 0)
+    }
+
     /// New quota pressure cancels only optional cloud work while retaining its execution slot until exit.
     func testQuotaWarningStopsAnAlreadyRunningCloudProbe() async throws {
         for policy in [RoutingPolicy.automatic, .localOnly] {

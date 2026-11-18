@@ -160,6 +160,89 @@ final class ProfileControlTests: XCTestCase {
         XCTAssertEqual(owner.storageStatus, .persisted)
     }
 
+    /// First path admission retains old timings; a later material change drops only the affected cloud path.
+    func testUnlockMergesLiveTimingsAndAppliesOnlyMaterialPathInvalidations() async throws {
+        for invalidateWiFi in [false, true] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let disk = singleProviderRouter(directory: directory, monitorConnection: false, calibrationIdentifier: "model")
+            disk.updateConnection(.init(kind: .wifi))
+            _ = try await disk.measure(model: .onDevice, inputTokens: 100, snapshot: disk.snapshot()) { 1 }
+            _ = try await disk.measure(model: .cloud, inputTokens: 101, snapshot: disk.snapshot()) { 1 }
+            disk.updateConnection(.init(kind: .wired))
+            _ = try await disk.measure(model: .cloud, inputTokens: 102, snapshot: disk.snapshot()) { 1 }
+            do {
+                let _: Int = try await disk.measure(model: .onDevice, inputTokens: 1, snapshot: disk.snapshot()) {
+                    throw URLError(.timedOut)
+                }
+                XCTFail("Expected the local failure")
+            } catch is URLError {}
+
+            let file = directory.appendingPathComponent("latency.json")
+            let manager = FileManager.default
+            try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+            let owner = singleProviderRouter(directory: directory, monitorConnection: false)
+            owner.updateConnection(.init(kind: .wifi))
+            owner.updateCalibrationIdentifier("model")
+            if invalidateWiFi {
+                owner.updateConnection(.init(kind: .cellular))
+                owner.updateConnection(.init(kind: .wifi))
+            }
+            _ = try await owner.measure(model: .onDevice, inputTokens: 200, snapshot: owner.snapshot()) { 1 }
+            XCTAssertEqual(owner.storageStatus, .unavailable)
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            _ = try await owner.measure(model: .onDevice, inputTokens: 300, snapshot: owner.snapshot()) { 1 }
+
+            let reopened = singleProviderRouter(directory: directory, monitorConnection: false, calibrationIdentifier: "model")
+            let expected = invalidateWiFi ? [100, 102, 200, 300] : [100, 101, 102, 200, 300]
+            XCTAssertEqual(reopened.profile.samples.map(\.tokens), expected)
+            XCTAssertTrue(reopened.profile.failures.isEmpty, "New local successes cleared the old local failure.")
+        }
+    }
+
+    /// Reapplying disk storage preserves a pending restore; first enabling it keeps the memory owner's timings.
+    func testSettingDiskWhileCacheIsLockedRespectsOriginalStorageMode() async throws {
+        for initialMode in [RoutingPersistence.disk, .memoryOnly] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let original = singleProviderRouter(directory: directory, monitorConnection: false)
+            _ = try await original.measure(model: .onDevice, inputTokens: 100, snapshot: original.snapshot()) { 1 }
+
+            let file = directory.appendingPathComponent("latency.json")
+            let manager = FileManager.default
+            try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+            let owner = singleProviderRouter(directory: directory, monitorConnection: false, persistence: initialMode)
+            owner.updateConnection(.init(kind: .wifi))
+            _ = try await owner.measure(model: .onDevice, inputTokens: 200, snapshot: owner.snapshot()) { 1 }
+            try owner.setPersistence(.disk)
+            XCTAssertEqual(owner.storageStatus, .unavailable)
+
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            _ = try await owner.measure(model: .onDevice, inputTokens: 300, snapshot: owner.snapshot()) { 1 }
+            let reopened = singleProviderRouter(directory: directory, monitorConnection: false)
+            XCTAssertEqual(reopened.profile.samples.map(\.tokens), initialMode == .disk ? [100, 200, 300] : [200, 300])
+        }
+    }
+
+    /// Superseding a known identity while locked never restores the explicitly abandoned timings, even on a round trip.
+    func testUnlockDoesNotRestoreAnExplicitlyInvalidatedProfile() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = singleProviderRouter(directory: directory, monitorConnection: false, calibrationIdentifier: "first")
+        _ = try await disk.measure(model: .onDevice, inputTokens: 100, snapshot: disk.snapshot()) { 1 }
+
+        let file = directory.appendingPathComponent("latency.json")
+        let manager = FileManager.default
+        try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+        let owner = singleProviderRouter(directory: directory, monitorConnection: false, calibrationIdentifier: "first")
+        owner.updateCalibrationIdentifier("second")
+        owner.updateCalibrationIdentifier("first")
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        _ = try await owner.measure(model: .onDevice, inputTokens: 200, snapshot: owner.snapshot()) { 1 }
+        let reopened = singleProviderRouter(directory: directory, monitorConnection: false, calibrationIdentifier: "first")
+        XCTAssertEqual(reopened.profile.samples.map(\.tokens), [200])
+    }
+
     /// A failed replacement while throttled leaves the profile usable and reports the reset failure.
     func testFailedThrottledResetPreservesProfile() async throws {
         let directory = try directory()

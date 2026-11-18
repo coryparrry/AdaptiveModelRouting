@@ -203,7 +203,10 @@ final class QuotaLifecycleSimulationTests: XCTestCase {
             XCTAssertNil(unavailable)
             backend.availability = .init(cloudQuota: .available)
             backend.localError = LanguageModelError.timeout(.init(debugDescription: "synthetic local failure"))
-            _ = try await invoke(reopened, format: format)
+            do {
+                _ = try await invoke(reopened, format: format)
+                XCTFail("A blocked cloud fallback must preserve the local provider failure.")
+            } catch LanguageModelError.timeout {}
             await reopened.waitForCalibration()
             XCTAssertEqual(backend.routes.filter { $0 == .cloud }.count, 1)
         }
@@ -270,8 +273,10 @@ final class QuotaLifecycleSimulationTests: XCTestCase {
         do { _ = try await failingCloud.value; XCTFail("Expected synthetic provider throttle") }
         catch is LanguageModelError {}
         localGate.release()
-        let result = try await waitingLocal.value
-        XCTAssertNil(result.value)
+        do {
+            _ = try await waitingLocal.value
+            XCTFail("The original local timeout must survive the new cloud throttle.")
+        } catch LanguageModelError.timeout {}
         XCTAssertEqual(lateCloudCalls, 0)
     }
 

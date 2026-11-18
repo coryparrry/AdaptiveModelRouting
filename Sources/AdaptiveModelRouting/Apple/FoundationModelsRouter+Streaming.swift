@@ -9,7 +9,7 @@ extension FoundationModelsRouter {
         RoutingStreamFactory.make { continuation in
             try await self.router.withRequest(deadline: deadline, onAttempt: onAttempt) { context in
                 let request = try await self.prepare(prompt: prompt, schema: nil, policy: policy, context: context)
-                return try await self.router.performStreaming(context: context, inputTokens: request.tokens,
+                let result = try await self.router.performStreaming(context: context, inputTokens: request.tokens,
                     localContextCapacity: request.capacity, policy: policy,
                     workload: .init(expectedOutputTokens: request.options.maximumResponseTokens), availability: request.availability, calibrationIdentifier: request.identity,
                     shouldFallback: { self.shouldFallback($0, $1) },
@@ -17,6 +17,7 @@ extension FoundationModelsRouter {
                     localPermission: { self.backend.availability(for: .localOnly).onDevice }, continuation: continuation,
                     cloud: { self.backend.textStream(route: .cloud, prompt: prompt, instructions: self.instructions, options: request.options) },
                     onDevice: { self.backend.textStream(route: .onDevice, prompt: prompt, instructions: self.instructions, options: request.options) })
+                return try request.resolve(result)
             }
         }
     }
@@ -28,7 +29,7 @@ extension FoundationModelsRouter {
         RoutingStreamFactory.make { continuation in
             try await self.router.withRequest(deadline: deadline, onAttempt: onAttempt) { context in
                 let request = try await self.prepare(prompt: prompt, schema: Content.generationSchema, policy: policy, context: context)
-                return try await self.router.performStreaming(context: context, inputTokens: request.tokens,
+                let result = try await self.router.performStreaming(context: context, inputTokens: request.tokens,
                     localContextCapacity: request.capacity, policy: policy,
                     workload: .init(expectedOutputTokens: request.options.maximumResponseTokens), availability: request.availability, calibrationIdentifier: request.identity,
                     shouldFallback: { self.shouldFallback($0, $1) },
@@ -38,6 +39,7 @@ extension FoundationModelsRouter {
                         options: request.options, generating: generating) },
                     onDevice: { self.backend.structuredStream(route: .onDevice, prompt: prompt, instructions: self.instructions,
                         options: request.options, generating: generating) })
+                return try request.resolve(result)
             }
         }
     }

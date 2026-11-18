@@ -4,6 +4,9 @@ import contextlib
 import io
 import json
 import os
+import select
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -92,6 +95,63 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "failed")
             self.assertEqual(rows[0]["exitCode"], 1)
             self.assertIn("Xcode 27", rows[0]["detail"])
+
+    def test_overlapping_validations_preserve_the_newer_runs_result(self):
+        """Queue a second process while an older run owns its logs, then retain the second run's failure."""
+        with tempfile.TemporaryDirectory() as folder, patch.object(sys, "argv", ["validate", "--artifacts", folder]):
+            artifacts = Path(folder)
+            newer = None
+
+            def older_run(args, root, results):
+                """Keep the first run active until the second validator has reached the directory lock."""
+                nonlocal newer
+                validate.run_step("fixture", [sys.executable, "-c", "print('older run')"], root, os.environ, results)
+                newer = subprocess.Popen([sys.executable, "-c",
+                    "from scripts import validate\n"
+                    "from unittest.mock import patch\n"
+                    "with patch.object(validate.subprocess, 'check_output', return_value='26.0'):\n"
+                    "    validate.main()", "--artifacts", str(root)],
+                    cwd=validate.ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                self.assertTrue(select.select([newer.stdout], [], [], 10)[0], "Second validation never started")
+                self.assertIn("Waiting for active validation", newer.stdout.readline())
+                records = json.loads((root / "summary.json").read_text())
+                self.assertEqual([r["step"] for r in records], ["fixture", "validation"])
+                self.assertEqual(records[-1]["status"], "running")
+                self.assertEqual((root / "fixture.log").read_text().strip(), "older run")
+
+            try:
+                with patch.object(validate, "validate", side_effect=older_run), contextlib.redirect_stdout(io.StringIO()):
+                    validate.main()
+                output, _ = newer.communicate(timeout=10)
+                self.assertEqual(newer.returncode, 1, output)
+                terminal, = json.loads((artifacts / "summary.json").read_text())
+                self.assertEqual(terminal["status"], "failed")
+                self.assertIn("Xcode 27", terminal["detail"])
+            finally:
+                if newer is not None:
+                    newer.kill()
+                    newer.communicate()
+
+    def test_local_consumers_resolve_dependencies_from_renamed_checkout(self):
+        """SwiftPM must load both checked-in manifests even when the local root directory is renamed."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "renamed-checkout"
+            root.mkdir()
+            shutil.copyfile(validate.ROOT / "Package.swift", root / "Package.swift")
+            environment = os.environ.copy()
+            environment.setdefault("SWIFTPM_MODULECACHE_OVERRIDE", str(Path(folder) / "module-cache"))
+            for relative in ["Demo", "Tests/SingleImportConsumer"]:
+                with self.subTest(package=relative):
+                    package = root / relative
+                    package.mkdir(parents=True)
+                    shutil.copyfile(validate.ROOT / relative / "Package.swift", package / "Package.swift")
+                    parsed = subprocess.run(["swift", "package", "--package-path", str(package),
+                                             "--cache-path", str(Path(folder) / "spm-cache"),
+                                             "--disable-sandbox", "dump-package"],
+                                            env=environment, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                    dependency, = json.loads(parsed.stdout)["dependencies"]
+                    self.assertEqual(Path(dependency["fileSystem"][0]["path"]).resolve(), root.resolve())
 
     def test_interrupt_after_passed_stage_is_marked_incomplete(self):
         """An interrupted validation retains its completed stages together with the terminal status."""

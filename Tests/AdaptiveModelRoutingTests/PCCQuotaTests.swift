@@ -16,6 +16,9 @@ final class PCCQuotaTests: XCTestCase {
         var availability = RoutingAvailability(cloudQuota: .available)
         var localContextCapacity = 8_192
         var tokenProvider: ControlledRoutingProvider?
+        var firstLocalProvider: ControlledRoutingProvider?
+        var tokenError: SystemLanguageModel.Error?
+        var localError: (any Error)?
         var cloudProvider: ControlledRoutingProvider?
         var cloudError: URLError?
         var localReadiness: [Bool] = []
@@ -37,6 +40,7 @@ final class PCCQuotaTests: XCTestCase {
         /// Can suspend the exact asynchronous preflight boundary where a quota snapshot becomes stale.
         func inputTokens(prompt: String, instructions: String?, schema: GenerationSchema?) async throws -> Int {
             tokenCalls += 1
+            if let tokenError { throw tokenError }
             if let tokenProvider { _ = await tokenProvider.call() }
             return 100
         }
@@ -47,6 +51,12 @@ final class PCCQuotaTests: XCTestCase {
             if route == .cloud {
                 if let cloudProvider { _ = await cloudProvider.call() }
                 if let cloudError { throw cloudError }
+            } else {
+                if let first = firstLocalProvider {
+                    firstLocalProvider = nil
+                    _ = await first.call()
+                }
+                if let localError { throw localError }
             }
             return route.rawValue
         }
@@ -80,6 +90,101 @@ final class PCCQuotaTests: XCTestCase {
             }
             XCTAssertTrue(completed)
             return route
+        }
+    }
+
+    /// An overlapping schema change can retire a local probe without cancelling the original text caller.
+    func testSchemaChangeDuringLocalProbePreservesForegroundCloudError() async throws {
+        let backend = Backend()
+        let cloud = ControlledRoutingProvider()
+        let local = ControlledRoutingProvider()
+        backend.cloudProvider = cloud
+        backend.firstLocalProvider = local
+        backend.cloudError = URLError(.networkConnectionLost)
+        let core = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+        let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+        defer { cloud.release(); local.release(); router.cancelCalibration() }
+        var attempts: [RoutingAttempt] = []
+        let first = Task {
+            try await router.respondDetailed(to: "first", onAttempt: { attempts.append($0) })
+        }
+        await cloud.started.wait()
+        await local.started.wait()
+        let second = try await router.respondDetailed(to: "second", generating: Summary.self, policy: .localOnly)
+        XCTAssertEqual(second.route, .onDevice)
+        XCTAssertEqual(router.lastCalibrationAttempt?.outcome, .cancelled)
+        cloud.release()
+        do {
+            _ = try await first.value
+            XCTFail("The original cloud failure must reach the first caller.")
+        } catch let error as URLError { XCTAssertEqual(error.code, .networkConnectionLost) }
+        XCTAssertFalse(first.isCancelled)
+        XCTAssertEqual(attempts.map(\.outcome), [.failed])
+        XCTAssertEqual(backend.routes.filter { $0 == .cloud }.count, 1)
+        XCTAssertEqual(backend.routes.filter { $0 == .onDevice }.count, 2)
+    }
+
+    /// Losing cloud eligibility during local generation preserves the timeout across all Apple formats.
+    func testLocalTimeoutSurvivesSkippedCloudFallback() async throws {
+        for format in 0..<4 {
+            let backend = Backend()
+            backend.localError = URLError(.timedOut)
+            backend.sequence = [.available, .available, .exhausted]
+            let core = singleProviderRouter(monitorConnection: false, persistence: .memoryOnly)
+            core.updateConnection(.init(kind: .offline)) // Prefer local, with recovery subject to fresh quota.
+            let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+            do {
+                _ = try await invoke(router, format: format)
+                XCTFail("A skipped fallback must preserve the local timeout.")
+            } catch let error as URLError { XCTAssertEqual(error.code, .timedOut) }
+            XCTAssertEqual(backend.routes, [.onDevice])
+            XCTAssertTrue(backend.sequence.isEmpty)
+            XCTAssertEqual(core.profile.failures.map(\.model), [.onDevice])
+        }
+    }
+
+    /// Rechecking quota after an asset error must preserve that error if no provider can generate.
+    func testTokenizationFailureSurvivesQuotaLossDuringRecovery() async throws {
+        for format in 0..<4 {
+            let backend = Backend()
+            backend.tokenError = .assetsUnavailable(.init(debugDescription: "fixture"))
+            backend.sequence = [.available, .available, .available, .exhausted]
+            let core = singleProviderRouter(monitorConnection: false, persistence: .memoryOnly)
+            let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+            do {
+                _ = try await invoke(router, format: format)
+                XCTFail("Expected the tokenization error when cloud recovery could not run.")
+            } catch SystemLanguageModel.Error.assetsUnavailable {}
+            XCTAssertTrue(backend.routes.isEmpty)
+            XCTAssertTrue(backend.sequence.isEmpty)
+        }
+    }
+
+    /// Local asset loss can recover through cloud at either SDK boundary when the caller permits it.
+    func testMissingLocalAssetsRespectProviderPolicy() async throws {
+        for format in 0..<4 {
+            for duringTokenization in [true, false] {
+                for policy in [RoutingPolicy.automatic, .localOnly] {
+                    let backend = Backend()
+                    let failure = SystemLanguageModel.Error.assetsUnavailable(.init(debugDescription: "test"))
+                    if duringTokenization { backend.tokenError = failure } else { backend.localError = failure }
+                    let core = singleProviderRouter(monitorConnection: false, persistence: .memoryOnly)
+                    if !duringTokenization { core.updateConnection(.init(kind: .offline)) }
+                    let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+                    if policy == .localOnly {
+                        do {
+                            _ = try await invoke(router, format: format, policy: policy)
+                            XCTFail("Asset loss must reach the local-only caller.")
+                        } catch SystemLanguageModel.Error.assetsUnavailable {}
+                        XCTAssertEqual(backend.routes, duringTokenization ? [] : [.onDevice])
+                        XCTAssertTrue(backend.policies.allSatisfy { $0 == .localOnly })
+                    } else {
+                        let route = try await invoke(router, format: format)
+                        XCTAssertEqual(route, .cloud)
+                        XCTAssertEqual(backend.routes, duringTokenization ? [.cloud] : [.onDevice, .cloud])
+                    }
+                }
+            }
         }
     }
 

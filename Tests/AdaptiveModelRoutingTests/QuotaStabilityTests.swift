@@ -65,6 +65,17 @@ final class QuotaStabilityTests: XCTestCase {
         XCTAssertEqual(decision(profile).route, .cloud)
     }
 
+    /// Unpaired cloud timings can fill the prediction window without displacing comparable completed pairs.
+    func testUnpairedCloudTimingsCannotDisplaceConfirmationEvidence() {
+        var profile = mixedProfile()
+        for index in 0..<6 { record(&profile, .cloud, 0.8, at: Double(index)) }
+        let unconfirmed = decision(profile)
+        XCTAssertEqual(unconfirmed.reason, .localCalibration)
+        XCTAssertEqual(unconfirmed.cloudEstimate?.sampleCount, 6)
+        record(&profile, .onDevice, 2, at: 6)
+        XCTAssertEqual(decision(profile).reason, .cloudPreferred)
+    }
+
     /// A decisive new cloud probe can promote immediately against every recent local observation.
     func testClearlyFasterCloudProbeCanPromoteImmediately() {
         var profile = mixedProfile()
