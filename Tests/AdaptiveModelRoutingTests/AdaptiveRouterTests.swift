@@ -161,7 +161,7 @@ final class AdaptiveRouterTests: XCTestCase {
             .profile.samples.count, 1)
         XCTAssertEqual(singleProviderRouter(directory: directory, system: "new-os", monitorConnection: false)
             .profile.samples.count, 0)
-        XCTAssertTrue(try hasBackupExclusion(at: directory))
+        XCTAssertTrue(try hasBackupExclusion(at: directory.appendingPathComponent("latency.json")))
     }
 
     /// Unavailable or failed requests cause backoff without making additional inference calls.

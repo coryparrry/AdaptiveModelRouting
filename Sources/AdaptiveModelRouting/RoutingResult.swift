@@ -26,8 +26,11 @@ public nonisolated struct RoutingAvailability: Equatable, Sendable {
             cloudQuota: cloudQuota)
     }
 
+    /// Indicates provider-wide quota pressure, including signals supplied with a local-only request.
+    var hasCloudQuotaPressure: Bool { cloudQuota == .approachingLimit || cloudQuota == .exhausted }
+
     /// Optional calibration never consumes a provider's remaining near-limit quota.
-    var permitsCloudCalibration: Bool { cloud && cloudQuota != .approachingLimit && cloudQuota != .exhausted }
+    var permitsCloudCalibration: Bool { cloud && !hasCloudQuotaPressure }
 }
 
 /// A weighted latency prediction and its recent variability, expressed in seconds.

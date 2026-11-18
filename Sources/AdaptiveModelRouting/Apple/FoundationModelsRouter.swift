@@ -141,6 +141,7 @@ public final class FoundationModelsRouter {
                 workload: .init(expectedOutputTokens: prepared.options.maximumResponseTokens), availability: prepared.availability, calibrationIdentifier: prepared.identity,
                 shouldFallback: { self.shouldFallback($0, $1) },
                 cloudPermission: { self.allowsCloud(policy: policy, calibration: $0) },
+                localPermission: { self.backend.availability(for: .localOnly).onDevice },
                 cloud: { _, _ in try await generate(.cloud, prepared.options) },
                 onDevice: { _, _ in try await generate(.onDevice, prepared.options) })
         }

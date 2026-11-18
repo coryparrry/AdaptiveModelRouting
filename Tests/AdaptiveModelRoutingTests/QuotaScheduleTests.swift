@@ -29,7 +29,7 @@ final class QuotaScheduleTests: XCTestCase {
     /// Missing/stale timing evidence and repeated cancellation cannot bypass a cloud-use cooldown.
     func testRequiredEvidenceAndCadenceResetCannotSpendEarly() {
         var schedule = RoutingCalibrationSchedule()
-        schedule.restoreCloudUse(now)
+        schedule.recordCloudUse(at: now)
         for second in 0..<600 {
             schedule.resetCadence()
             XCTAssertFalse(schedule.shouldProbe(required: true, configuration: .paired(refreshEvery: 1), route: .cloud,

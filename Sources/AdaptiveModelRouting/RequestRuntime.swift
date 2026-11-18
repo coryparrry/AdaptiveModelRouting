@@ -65,6 +65,9 @@ final class RoutingRequestContext {
         attempt = (route, .now)
     }
 
+    /// Drops a fallback wait when its optional worker declined before invoking any provider.
+    func discardUndispatchedAttempt() { attempt = nil }
+
     /// Publishes one outcome while suppressing callbacks from abandoned operations.
     func finishAttempt(_ outcome: RoutingAttempt.Outcome) {
         guard active, let attempt else { return }

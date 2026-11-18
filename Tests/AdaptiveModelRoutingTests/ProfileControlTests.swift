@@ -42,6 +42,124 @@ final class ProfileControlTests: XCTestCase {
         }
     }
 
+    /// A protected cache can be reopened after unlock without losing a throttle or blocking local work.
+    func testTemporaryCacheReadFailureRecoversOnUnlock() async throws {
+        for startInMemory in [false, true] {
+            let directory = try directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let disk = singleProviderRouter(directory: directory, monitorConnection: false)
+            do {
+                let _: Int = try await disk.measure(model: .cloud, inputTokens: 1, snapshot: disk.snapshot()) {
+                    throw Throttle(routingRetryAfter: .now.addingTimeInterval(600))
+                }
+                XCTFail("Expected throttling")
+            } catch is Throttle {}
+
+            let file = directory.appendingPathComponent("latency.json")
+            let original = try Data(contentsOf: file)
+            let manager = FileManager.default
+            try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+            defer { try? manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+            let router = singleProviderRouter(directory: directory, monitorConnection: false,
+                persistence: startInMemory ? .memoryOnly : .disk)
+            if startInMemory { try router.setPersistence(.disk) }
+            XCTAssertEqual(router.storageStatus, .unavailable)
+            XCTAssertThrowsError(try router.resetProfile())
+            XCTAssertThrowsError(try router.setPersistence(.memoryOnly))
+            XCTAssertEqual(router.persistence, .disk)
+
+            let blocked = try await router.respondDetailed(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+                cloud: { XCTFail("The saved deadline is unreadable"); return 1 }, onDevice: { 2 })
+            XCTAssertEqual(blocked.status, .unavailable)
+            let local = try await router.respond(inputTokens: 1, localContextCapacity: 8192,
+                cloud: { XCTFail("Local inference can serve while storage is locked"); return 1 }, onDevice: { 2 })
+            XCTAssertEqual(local, 2)
+
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            XCTAssertEqual(try Data(contentsOf: file), original)
+            let throttled = try await router.respondDetailed(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+                cloud: { XCTFail("Recovered owner must respect the stored deadline"); return 1 }, onDevice: { 2 })
+            XCTAssertEqual(throttled.status, .unavailable)
+            XCTAssertEqual(router.storageStatus, .notPersisted)
+            let resumed = try await router.respond(inputTokens: 1, localContextCapacity: 8192,
+                cloud: { XCTFail("Still throttled"); return 1 }, onDevice: { 2 })
+            XCTAssertEqual(resumed, 2)
+            XCTAssertEqual(router.storageStatus, .persisted)
+            let reloaded = singleProviderRouter(directory: directory, monitorConnection: false)
+            XCTAssertEqual(reloaded.profile.samples.count, 2, "Preserve local learning from before and after unlock")
+            try router.resetProfile()
+            let reset = singleProviderRouter(directory: directory, monitorConnection: false)
+            let afterReset = try await reset.respondDetailed(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+                cloud: { XCTFail("The recovered deadline must survive a reset"); return 1 }, onDevice: { 2 })
+            XCTAssertEqual(afterReset.status, .unavailable)
+        }
+    }
+
+    /// A non-clearing opt-out detaches a locked cache even when an earlier cloud call still owes a retry hint.
+    func testDetachFromUnreadableCachePreventsLateWrites() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = singleProviderRouter(directory: directory, monitorConnection: false)
+        _ = try await disk.measure(model: .onDevice, inputTokens: 3, snapshot: disk.snapshot()) { 1 }
+        let file = directory.appendingPathComponent("latency.json")
+        let original = try Data(contentsOf: file)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false, persistence: .memoryOnly)
+        let provider = ControlledRoutingProvider()
+        let request = Task {
+            try await router.respond(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired, cloud: {
+                _ = await provider.call()
+                throw Throttle(routingRetryAfter: .now.addingTimeInterval(600))
+            }, onDevice: { 2 })
+        }
+        defer { provider.release() }
+        await provider.started.wait()
+        let manager = FileManager.default
+        try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+        try router.setPersistence(.disk)
+        XCTAssertEqual(router.storageStatus, .unavailable)
+        try router.setPersistence(.memoryOnly, clearExistingCache: false)
+        XCTAssertEqual(router.persistence, .memoryOnly)
+        XCTAssertEqual(router.storageStatus, .memoryOnly)
+        XCTAssertThrowsError(try router.setPersistence(.memoryOnly))
+        XCTAssertEqual(router.storageStatus, .memoryOnly)
+        try router.resetProfile()
+
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let blocked = try await router.respondDetailed(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+            cloud: { XCTFail("Detached owner cannot check previous pacing"); return 1 }, onDevice: { 2 })
+        XCTAssertEqual(blocked.status, .unavailable)
+        provider.release()
+        do { _ = try await request.value; XCTFail("Expected the late throttle") }
+        catch is Throttle {}
+        XCTAssertEqual(router.storageStatus, .memoryOnly)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+
+        try router.setPersistence(.disk)
+        let restored = singleProviderRouter(directory: directory, monitorConnection: false)
+        let throttled = try await restored.respondDetailed(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+            cloud: { XCTFail("Reattaching disk must persist the late in-memory throttle"); return 1 }, onDevice: { 2 })
+        XCTAssertEqual(throttled.status, .unavailable)
+    }
+
+    /// A clean owner restores saved timings and resumes eligible cloud requests on its first read after unlock.
+    func testUnlockRestoresPristineProfileAndUnthrottledCloud() async throws {
+        let directory = try directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = singleProviderRouter(directory: directory, monitorConnection: false)
+        _ = try await disk.measure(model: .onDevice, inputTokens: 3, snapshot: disk.snapshot()) { 1 }
+        let file = directory.appendingPathComponent("latency.json")
+        let manager = FileManager.default
+        try manager.setAttributes([.posixPermissions: 0], ofItemAtPath: file.path)
+        let owner = singleProviderRouter(directory: directory, monitorConnection: false)
+        XCTAssertEqual(owner.storageStatus, .unavailable)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let result = try await owner.respond(inputTokens: 1, localContextCapacity: 8192, policy: .cloudRequired,
+            cloud: { 1 }, onDevice: { XCTFail("Requested cloud explicitly"); return 2 })
+        XCTAssertEqual(result, 1)
+        XCTAssertEqual(owner.profile.samples.map(\.model), [.onDevice, .cloud])
+        XCTAssertEqual(owner.storageStatus, .persisted)
+    }
+
     /// A failed replacement while throttled leaves the profile usable and reports the reset failure.
     func testFailedThrottledResetPreservesProfile() async throws {
         let directory = try directory()

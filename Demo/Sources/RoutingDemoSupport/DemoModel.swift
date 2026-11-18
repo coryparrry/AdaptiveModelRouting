@@ -60,9 +60,36 @@ public struct DemoAttempt: Identifiable, Sendable {
     public let duration: String
 }
 
-/// Persists only the explicit storage preference, independently of prompt or response content.
-private struct DemoStoragePreference: Codable {
-    let enabled: Bool
+/// Keeps disk opt-in independent for simulated and Apple workloads.
+private struct DemoStoragePreferences: Codable {
+    var simulated = false
+    var apple = false
+
+    /// Reads and updates the explicit choice for exactly one provider mode.
+    subscript(mode: DemoMode) -> Bool {
+        get { mode == .simulated ? simulated : apple }
+        set {
+            switch mode {
+            case .simulated: simulated = newValue
+            case .apple: apple = newValue
+            }
+        }
+    }
+}
+
+/// Retains exactly one router owner for the current mode and configuration.
+@MainActor
+private enum DemoRoutingOwner {
+    case simulated(AdaptiveRouter)
+    case apple(FoundationModelsRouter)
+
+    /// Provides the same storage and calibration controls for either provider.
+    var router: AdaptiveRouter {
+        switch self {
+        case .simulated(let router): router
+        case .apple(let adapter): adapter.router
+        }
+    }
 }
 
 /// Owns the sample's routing flow and guards observable state against late cancelled-task completion.
@@ -70,12 +97,18 @@ private struct DemoStoragePreference: Codable {
 @Observable
 public final class DemoModel {
     public var prompt = "Summarize the trade-offs between local and cloud models."
-    public var mode: DemoMode = .simulated
+    public var mode: DemoMode = .simulated {
+        didSet { if mode != oldValue { replaceOwner() } }
+    }
     public var policy: DemoPolicy = .local
-    public var preset: DemoPreset = .fastest
+    public var preset: DemoPreset = .fastest {
+        didSet { if preset != oldValue { replaceOwner() } }
+    }
     public var fault: DemoFault = .none
-    public var deadlineSeconds = 5.0
-    public private(set) var persistCalibration = false
+    public var deadlineSeconds = 5.0 {
+        didSet { if deadlineSeconds != oldValue { replaceOwner() } }
+    }
+    public var persistCalibration: Bool { storagePreferences[mode] }
     public private(set) var output = ""
     public private(set) var status = "Ready"
     public private(set) var isRunning = false
@@ -86,29 +119,30 @@ public final class DemoModel {
     public private(set) var storageLabel = "In memory"
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
-    @ObservationIgnored private var appliedKey = ""
+    @ObservationIgnored private var visibleWindows = Set<UUID>()
     @ObservationIgnored private let cacheRoot: URL
-    @ObservationIgnored private var core: AdaptiveRouter
-    @ObservationIgnored private var apple: FoundationModelsRouter?
+    private var storagePreferences = DemoStoragePreferences()
+    @ObservationIgnored private lazy var owner = makeOwner()
+    var activeRouter: AdaptiveRouter { owner.router }
 
     /// Starts with fixture routing and restores only the user's explicit calibration-storage preference.
     public init(cacheRoot: URL = URL.applicationSupportDirectory.appendingPathComponent("AdaptiveModelRoutingDemo")) {
         self.cacheRoot = cacheRoot
+        // A legacy global Boolean cannot establish permission for either individual mode.
         if let data = try? Data(contentsOf: cacheRoot.appendingPathComponent("storage-preference.json")),
-            let preference = try? JSONDecoder().decode(DemoStoragePreference.self, from: data) {
-            persistCalibration = preference.enabled
+           let preferences = try? JSONDecoder().decode(DemoStoragePreferences.self, from: data) {
+            storagePreferences = preferences
         }
-        core = AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false, persistence: .memoryOnly)
+        refreshProfile()
     }
 
     /// Runs one streaming request; a generation token prevents an old task from overwriting a later run.
     public func start() {
         guard !isRunning, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        configure()
         generation += 1
         let token = generation
         let prompt = prompt
-        let selectedMode = mode
+        let requestOwner = owner
         let policy = policy.value
         let fault = fault
         output = ""
@@ -122,16 +156,17 @@ public final class DemoModel {
                 duration: String(format: "%.3f s", attempt.seconds)))
         }
         task = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, self.generation == token, !Task.isCancelled else { return }
             defer {
                 if self.generation == token { self.isRunning = false; self.task = nil; self.refreshProfile() }
             }
             do {
                 let stream: AsyncThrowingStream<RoutingStreamEvent<String>, any Error>
-                if selectedMode == .apple, let apple = self.apple {
+                switch requestOwner {
+                case .apple(let apple):
                     stream = apple.stream(to: prompt, policy: policy, onAttempt: observer)
-                } else {
-                    stream = self.core.stream(inputTokens: max(1, (prompt.utf8.count + 3) / 4), localContextCapacity: 8_192,
+                case .simulated(let core):
+                    stream = core.stream(inputTokens: max(1, (prompt.utf8.count + 3) / 4), localContextCapacity: 8_192,
                         policy: policy, workload: .init(expectedOutputTokens: 256), onAttempt: observer,
                         cloud: { self.fixtureStream(route: .cloud, fault: fault) },
                         onDevice: { self.fixtureStream(route: .onDevice, fault: .none) })
@@ -163,8 +198,18 @@ public final class DemoModel {
         }
     }
 
-    /// Cancels immediately while preserving any partial output for inspection.
+    /// Registers one visible view sharing this demo session.
+    public func windowAppeared(_ id: UUID) { visibleWindows.insert(id) }
+
+    /// Stops foreground and calibration work once the last view leaves the shared session.
+    public func windowDisappeared(_ id: UUID) {
+        guard visibleWindows.remove(id) != nil, visibleWindows.isEmpty else { return }
+        cancel()
+    }
+
+    /// Cancels ongoing foreground or calibration work while preserving displayed output.
     public func cancel() {
+        activeRouter.cancelCalibration()
         guard isRunning else { return }
         generation += 1
         task?.cancel()
@@ -180,7 +225,6 @@ public final class DemoModel {
     /// Resets only the selected demo mode's calibration and reports filesystem failures.
     public func resetProfile() {
         guard !isRunning else { return }
-        configure()
         do { try activeRouter.resetProfile(); status = "Calibration reset"; errorMessage = nil }
         catch { errorMessage = error.localizedDescription }
         refreshProfile()
@@ -189,37 +233,51 @@ public final class DemoModel {
     /// Applies an explicit storage choice to the selected workload and clears its file when disabling disk.
     public func setPersistence(_ enabled: Bool) {
         guard !isRunning else { return }
-        configure()
         do {
-            try activeRouter.setPersistence(enabled ? .disk : .memoryOnly)
-            persistCalibration = enabled
+            var updated = storagePreferences
+            updated[mode] = enabled
             try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
-            let preference = try JSONEncoder().encode(DemoStoragePreference(enabled: enabled))
-            try preference.write(to: cacheRoot.appendingPathComponent("storage-preference.json"), options: .atomic)
+            let data = try JSONEncoder().encode(updated)
+            try data.write(to: cacheRoot.appendingPathComponent("storage-preference.json"), options: .atomic)
+            storagePreferences = updated
+            try activeRouter.setPersistence(enabled ? .disk : .memoryOnly)
             errorMessage = nil
-        } catch { errorMessage = error.localizedDescription }
-        refreshProfile()
-    }
-
-    /// Keeps the router alive while its workload settings remain stable.
-    private func configure() {
-        let key = "\(mode.rawValue)|\(preset.rawValue)|\(deadlineSeconds)"
-        guard key != appliedKey else { return }
-        appliedKey = key
-        let configuration = RoutingConfiguration(customizing: preset.value,
-            requestDeadline: .after(.seconds(max(0.001, deadlineSeconds))))
-        if mode == .apple {
-            apple = FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.", configuration: configuration,
-                options: .init(maximumResponseTokens: 256), cacheRoot: cacheRoot.appendingPathComponent("apple"),
-                persistence: persistCalibration ? .disk : .memoryOnly)
-        } else {
-            core = AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false,
-                configuration: configuration, persistence: persistCalibration ? .disk : .memoryOnly, calibrationIdentifier: "simulated-v1")
+        } catch {
+            // Honor an opt-out for this session even if preference persistence or file removal failed.
+            if !enabled {
+                storagePreferences[mode] = false
+                try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
+            }
+            errorMessage = error.localizedDescription
         }
         refreshProfile()
     }
 
-    private var activeRouter: AdaptiveRouter { mode == .apple ? (apple?.router ?? core) : core }
+    /// Retires the previous owner before another router can read or write the same cache.
+    private func replaceOwner() {
+        cancel()
+        // The memory-only transition with clearing disabled does no file I/O. A late SDK
+        // error can still carry a retry hint, but the retired owner can no longer write the file.
+        try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
+        owner = makeOwner()
+        refreshProfile()
+    }
+
+    /// Opens the selected workload with its own persisted storage choice.
+    private func makeOwner() -> DemoRoutingOwner {
+        let configuration = RoutingConfiguration(customizing: preset.value,
+            requestDeadline: .after(.seconds(max(0.001, deadlineSeconds))))
+        let persistence: RoutingPersistence = persistCalibration ? .disk : .memoryOnly
+        switch mode {
+        case .apple:
+            return .apple(FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.",
+                configuration: configuration, options: .init(maximumResponseTokens: 256),
+                cacheRoot: cacheRoot.appendingPathComponent("apple"), persistence: persistence))
+        case .simulated:
+            return .simulated(AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false,
+                configuration: configuration, persistence: persistence, calibrationIdentifier: "simulated-v1"))
+        }
+    }
 
     /// Updates presentation fields after controls or requests change calibration.
     private func refreshProfile() {

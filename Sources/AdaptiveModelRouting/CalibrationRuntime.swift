@@ -84,16 +84,17 @@ struct RoutingCalibrationSchedule {
         guard let required, case .paired(let frequency, _) = configuration else { return false }
         if requestsSinceProbe < frequency { requestsSinceProbe += 1 }
         guard required || requestsSinceProbe >= frequency else { return false }
-        if route == .cloud, let lastCloudUse,
-           now.timeIntervalSince(lastCloudUse) < cloudInterval { return false }
-        return true
+        return route != .cloud || permitsOptionalCloud(at: now, interval: cloudInterval)
+    }
+
+    /// Rechecks the cooldown independently of request cadence at optional dispatch.
+    func permitsOptionalCloud(at now: Date, interval: TimeInterval) -> Bool {
+        guard let lastCloudUse else { return true }
+        return now.timeIntervalSince(lastCloudUse) >= interval
     }
 
     /// Reserves quota pacing at actual cloud callback dispatch, including failed or cancelled operations.
     mutating func recordCloudUse(at date: Date) { lastCloudUse = max(lastCloudUse ?? date, date) }
-
-    /// Restores cooldown metadata without interpreting it as a successful latency observation.
-    mutating func restoreCloudUse(_ date: Date?) { lastCloudUse = date }
 
     /// Restarts request counting while retaining the cloud-use cooldown.
     mutating func resetCadence() { requestsSinceProbe = 0 }
@@ -136,11 +137,11 @@ final class RoutingCalibrationCoordinator {
             cloudInterval: cloudInterval, now: now)
     }
 
+    /// Detects cloud use between scheduling a probe and its worker starting.
+    func permitsOptionalCloud(interval: TimeInterval) -> Bool { schedule.permitsOptionalCloud(at: .now, interval: interval) }
+
     /// Records admitted cloud work even when it later times out or supplies no calibration timing.
     func recordCloudUse(at date: Date = .now) { schedule.recordCloudUse(at: date) }
-
-    /// Restores app-owned pacing across normal launches and calibration identity changes.
-    func restoreCloudUse(_ date: Date?) { schedule.restoreCloudUse(date) }
 
     /// Stops optional cloud work when a newer request observes quota pressure or cloud ineligibility.
     func cancelCloudProbe() { if route == .cloud { cancel() } }

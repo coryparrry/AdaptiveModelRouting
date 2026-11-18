@@ -201,7 +201,10 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
     mutating func record(model: InferenceRoute, tokens: Int, seconds: Double, connection: Connection,
         now: Date, workload: RoutingWorkload, configuration: RoutingConfiguration, comparisonID: UUID?
     ) {
-        guard tokens > 0, seconds.isFinite, seconds > 0 else { return }
+        guard seconds.isFinite, seconds > 0, tokens >= 0 else { return }
+        failures.removeAll { $0.model == model && (model == .onDevice || $0.connection == connection) }
+        failures.removeAll { now.timeIntervalSince($0.date) > configuration.failureBackoff }
+        guard tokens > 0 else { return }
         samples.removeAll { now.timeIntervalSince($0.date) < 0 || now.timeIntervalSince($0.date) > configuration.sampleLifetime }
         let matched = comparisonID.flatMap { id in samples.lastIndex { $0.comparisonID == id && $0.model != model } }
         let localSeconds = model == .cloud ? matched.map { samples[$0].seconds } : nil
@@ -214,8 +217,6 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
             excess -= 1
             return true
         }
-        failures.removeAll { $0.model == model && (model == .onDevice || $0.connection == connection) }
-        failures.removeAll { now.timeIntervalSince($0.date) > configuration.failureBackoff }
     }
 
     /// Applies a short cooldown after a model failure, cloud unavailability or quota exhaustion.

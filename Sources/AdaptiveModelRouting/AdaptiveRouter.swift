@@ -48,7 +48,13 @@ public final class AdaptiveRouter {
     private let system: String
     public let configuration: RoutingConfiguration
     private let monitor: NWPathMonitor?
-    private var maySave = true
+    /// Separates normal storage, deliberately preserved bytes and a file awaiting another read.
+    private enum CacheAccess {
+        case writable
+        case preserved
+        case awaitingRead(restoreProfile: Bool)
+    }
+    private var cacheAccess: CacheAccess = .writable
     private let calibration: RoutingCalibrationCoordinator
     private var file: URL { directory.appendingPathComponent("latency.json") }
 
@@ -69,23 +75,7 @@ public final class AdaptiveRouter {
         self.monitor = monitorConnection ? NWPathMonitor() : nil
         self.calibration = RoutingCalibrationCoordinator(awaitStartupObservations: monitorConnection)
         if persistence == .memoryOnly { storageStatus = .memoryOnly }
-        else {
-            do {
-                let cache = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: file))
-                if cache.version == 1 {
-                    mergeCloudPacing(from: cache)
-                    lastLocalLearning = cache.lastLocalLearning
-                }
-                if cache.version != 1 { maySave = false; storageStatus = .preservedCache }
-                else if cache.system == system && (calibrationIdentifier == nil || cache.identity == identity) {
-                    profile = cache.profile
-                    identity = cache.identity
-                    storageStatus = .persisted
-                }
-            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-                // A new cache starts uncalibrated.
-            } catch { maySave = false; storageStatus = .preservedCache }
-        }
+        else { try? loadCache(restoreProfile: true) }
         monitor?.pathUpdateHandler = { [weak self] path in
             let observedAt = ContinuousClock.now
             Task { @MainActor [weak self] in self?.receiveNativePath(path, observedAt: observedAt) }
@@ -129,7 +119,7 @@ public final class AdaptiveRouter {
         let decision = profile.executionDecision(inputTokens: inputTokens, localCapacity: localCapacity, connection: connection,
             now: now, configuration: configuration, policy: policy, workload: workload, availability: ready,
             lastCloudUse: calibration.lastCloudUse, lastLocalLearning: lastLocalLearning ?? .distantPast)
-        if !permitsCloud(now: now), decision.reason == .cloudUnavailable {
+        if let cloudRetryAfter, now < cloudRetryAfter, decision.reason == .cloudUnavailable {
             return .init(route: .onDevice, reason: .cloudBackoff)
         }
         return decision
@@ -178,6 +168,7 @@ public final class AdaptiveRouter {
         calibrationIdentifier: String? = nil, onDecision: ((RoutingDecision) -> Void)? = nil, canFallback: () -> Bool = { true },
         shouldFallback: @escaping @MainActor (InferenceRoute, any Error) -> Bool,
         cloudPermission: @escaping @MainActor (Bool) -> Bool = { _ in true },
+        localPermission: @escaping @MainActor () -> Bool = { true },
         onProbeFallback: ((Value, InferenceRoute) throws -> Void)? = nil,
         cloud: @escaping @MainActor (RoutingRequestContext, Bool) async throws -> Value?,
         onDevice: @escaping @MainActor (RoutingRequestContext, Bool) async throws -> Value
@@ -189,7 +180,9 @@ public final class AdaptiveRouter {
         let cloudPermission: @MainActor (Bool) -> Bool = { calibration in
             self.permitsCloud(now: .now) && suppliedCloudPermission(calibration)
         }
-        if !availability.permitsCloudCalibration { calibration.cancelCloudProbe() }
+        if availability.hasCloudQuotaPressure || (policy != .localOnly && !availability.cloud) {
+            calibration.cancelCloudProbe()
+        }
         if let calibrationIdentifier { updateCalibrationIdentifier(calibrationIdentifier) }
         let snapshot = snapshot()
         let decisionDate = Date.now
@@ -244,6 +237,10 @@ public final class AdaptiveRouter {
                 onAttempt: { [calibration] in calibration.record($0) }) { probeContext in
                     do {
                         if route == .cloud && !cloudPermission(true) { return nil }
+                        if route == .cloud && !self.calibration.permitsOptionalCloud(interval: self.configuration.cloudRetryInterval) {
+                            return nil
+                        }
+                        if route == .onDevice && !localPermission() { return nil }
                         return try await self.track(model: route, inputTokens: inputTokens, snapshot: snapshot,
                             workload: workload, context: probeContext, comparisonID: pairID, available: { $0 != nil }) {
                                 if route == .cloud {
@@ -270,7 +267,9 @@ public final class AdaptiveRouter {
             shouldFallback: { classify($0, $1, context) }, cloud: {
                 guard availability.cloud else { return nil }
                 if let probe, probe.route == .cloud {
-                    return try await consumeProbe(probe, context: context, onValue: onProbeFallback)
+                    let value = try await consumeProbe(probe, context: context, onValue: onProbeFallback)
+                    if value != nil || !probe.context.attempts.isEmpty { return value }
+                    // An optional worker that declined before dispatch leaves the foreground call available.
                 }
                 guard cloudPermission(false) else { return nil }
                 return try await track(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
@@ -282,10 +281,10 @@ public final class AdaptiveRouter {
                     }
             }, onDevice: {
                 if let probe, probe.route == .onDevice {
-                    guard let value = try await consumeProbe(probe, context: context, onValue: onProbeFallback)
-                        else { throw RoutingRequestError.emptyStream }
-                    return value
+                    let value = try await consumeProbe(probe, context: context, onValue: onProbeFallback)
+                    if value != nil || !probe.context.attempts.isEmpty { return value }
                 }
+                guard localPermission() else { return nil }
                 return try await track(model: .onDevice, inputTokens: inputTokens, snapshot: snapshot,
                     workload: workload, context: context, comparisonID: comparisonID, available: { _ in true }) { try await onDevice(context, false) }
             })
@@ -305,7 +304,8 @@ public final class AdaptiveRouter {
             let value = try await probe.task.value.value
             try context.checkActive()
             if let value { try onValue?(value, probe.route) }
-            context.finishAttempt(value == nil ? .unavailable : .succeeded)
+            if value == nil && probe.context.attempts.isEmpty { context.discardUndispatchedAttempt() }
+            else { context.finishAttempt(value == nil ? .unavailable : .succeeded) }
             return value
         } catch {
             let error = context.effectiveError(error)
@@ -465,7 +465,14 @@ public final class AdaptiveRouter {
     }
 
     /// Tests provider-wide retry eligibility independently of calibration identity or connection history.
-    private func permitsCloud(now: Date) -> Bool { cloudRetryAfter.map { now >= $0 } ?? true }
+    private func permitsCloud(now: Date) -> Bool {
+        if case .awaitingRead = cacheAccess {
+            guard persistence == .disk else { return false }
+            do { try retryPendingCacheRead() }
+            catch { return false }
+        }
+        return cloudRetryAfter.map { now >= $0 } ?? true
+    }
 
     /// Masks cloud readiness while a known server reset deadline remains in the future.
     private func providerAvailability(_ value: RoutingAvailability, now: Date) -> RoutingAvailability {
@@ -492,30 +499,77 @@ public final class AdaptiveRouter {
         }
     }
 
+    /// Loads a known format, preserving malformed or future files until an explicit reset.
+    /// Temporary filesystem errors leave the owner able to retry without replacing unread pacing metadata.
+    private func loadCache(restoreProfile: Bool) throws {
+        do {
+            let cache = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: file))
+            guard cache.version == 1 else {
+                cacheAccess = .preserved
+                storageStatus = .preservedCache
+                return
+            }
+            cacheAccess = .writable
+            mergeCloudPacing(from: cache)
+            storageStatus = .notPersisted
+            if restoreProfile {
+                lastLocalLearning = cache.lastLocalLearning
+                if cache.system == system && (identity == nil || cache.identity == identity) {
+                    profile = cache.profile
+                    identity = cache.identity
+                    storageStatus = .persisted
+                }
+            }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            cacheAccess = .writable
+            storageStatus = .notPersisted
+        } catch {
+            if error is DecodingError || (try? file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                cacheAccess = .preserved
+                storageStatus = .preservedCache
+                return
+            }
+            cacheAccess = .awaitingRead(restoreProfile: restoreProfile)
+            storageStatus = .unavailable
+            throw error
+        }
+    }
+
+    /// Restores the previous timings only while the owner is pristine; later reads merge pacing into live state.
+    private func retryPendingCacheRead() throws {
+        guard case let .awaitingRead(restoreProfile) = cacheAccess else { return }
+        let pristine = profileGeneration == 0 && generation == 0 && profile.samples.isEmpty && profile.failures.isEmpty
+        try loadCache(restoreProfile: restoreProfile && pristine)
+    }
+
     /// Clears learned timings while preserving any active provider retry deadline and its pacing metadata.
     public func resetProfile() throws {
-        let retainDeadline = !permitsCloud(now: .now)
         if persistence == .disk {
-            if retainDeadline { try writeCache(profile: .init()) }
-            else { try removeCache() }
+            try retryPendingCacheRead()
+            if let cloudRetryAfter, cloudRetryAfter > .now {
+                try writeCache(profile: .init())
+                storageStatus = .persisted
+            } else {
+                try removeCache()
+                storageStatus = .notPersisted
+            }
+            cacheAccess = .writable
         }
         calibration.cancel()
         profileGeneration += 1
         profile = .init()
-        maySave = true
-        storageStatus = persistence == .memoryOnly ? .memoryOnly : (retainDeadline ? .persisted : .notPersisted)
     }
 
     /// Changes storage policy; disabling disk storage clears the owned cache by default.
     public func setPersistence(_ value: RoutingPersistence, clearExistingCache: Bool = true) throws {
-        if value == .memoryOnly, clearExistingCache { try removeCache(); maySave = true }
         if value == .disk {
-            do {
-                let existing = try JSONDecoder().decode(Cache.self, from: Data(contentsOf: file))
-                maySave = existing.version == 1
-                if maySave { mergeCloudPacing(from: existing) }
-            } catch let error as CocoaError where error.code == .fileReadNoSuchFile { maySave = true }
-            catch { maySave = false }
+            try? loadCache(restoreProfile: false)
+        } else if clearExistingCache {
+            // Explicit deletion must retain unread pacing even after a prior, non-clearing detach.
+            defer { if persistence == .memoryOnly { storageStatus = .memoryOnly } }
+            try retryPendingCacheRead()
+            try removeCache()
+            cacheAccess = .writable
         }
         persistence = value
         calibration.cancel()
@@ -548,8 +602,9 @@ public final class AdaptiveRouter {
     /// Writes bounded metadata only; storage failure must never interrupt recording or inference.
     private func save() {
         guard persistence == .disk else { storageStatus = .memoryOnly; return }
-        guard maySave else { storageStatus = .preservedCache; return }
         do {
+            try retryPendingCacheRead()
+            if case .preserved = cacheAccess { storageStatus = .preservedCache; return }
             try writeCache(profile: profile)
             storageStatus = .persisted
         } catch { storageStatus = .unavailable }
@@ -558,16 +613,20 @@ public final class AdaptiveRouter {
     /// Atomically replaces the owned metadata, preserving the previous file on write failure.
     private func writeCache(profile: PerformanceProfile) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var directory = directory
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try directory.setResourceValues(values)
         let data = try JSONEncoder().encode(Cache(version: 1, system: system, profile: profile, identity: identity,
             lastCloudUse: calibration.lastCloudUse, cloudRetryAfter: cloudRetryAfter, lastLocalLearning: lastLocalLearning))
+        var staged = directory.appendingPathComponent(".latency-\(UUID().uuidString).tmp")
         #if os(iOS)
-        try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try data.write(to: staged, options: [.withoutOverwriting, .completeFileProtectionUntilFirstUserAuthentication])
         #else
-        try data.write(to: file, options: .atomic)
+        try data.write(to: staged, options: .withoutOverwriting)
         #endif
+        defer { try? FileManager.default.removeItem(at: staged) }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try staged.setResourceValues(values)
+        guard Darwin.rename(staged.path, file.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }

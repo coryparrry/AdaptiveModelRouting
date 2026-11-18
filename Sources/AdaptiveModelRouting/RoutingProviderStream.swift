@@ -4,7 +4,7 @@ import Foundation
 /// The producer must await its SDK/transport work rather than launch detached work and return early.
 public struct RoutingProviderStream<Value: Sendable>: Sendable {
     let stream: AsyncThrowingStream<Value, any Error>
-    private let finish: @MainActor () async -> (any Error)?
+    private let finish: @MainActor (Bool) async -> (any Error)?
 
     /// Owns generation through producer exit, even when a cancelled consumer stops iterating sooner.
     @MainActor
@@ -24,18 +24,27 @@ public struct RoutingProviderStream<Value: Sendable>: Sendable {
                 return error
             }
         }
-        continuation.onTermination = { _ in task.cancel() }
+        continuation.onTermination = { reason in
+            if case .cancelled = reason { task.cancel() }
+        }
         self.stream = stream
-        finish = { task.cancel(); return await task.value }
+        finish = { cancel in
+            if cancel { task.cancel() }
+            return await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
+        }
     }
 
     /// Adapts legacy streams whose external producer lifetime remains the supplying app's responsibility.
     init(unowned stream: AsyncThrowingStream<Value, any Error>) {
         self.stream = stream
-        finish = { nil }
+        finish = { _ in nil }
     }
 
     /// Awaits actual producer exit and preserves errors that arrive after the stream consumer has cancelled.
     @MainActor
-    func finishProducer() async -> (any Error)? { await finish() }
+    func finishProducer(cancelling: Bool) async -> (any Error)? { await finish(cancelling) }
 }

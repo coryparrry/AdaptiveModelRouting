@@ -76,6 +76,7 @@ extension AdaptiveRouter {
         policy: RoutingPolicy, workload: RoutingWorkload, availability: RoutingAvailability,
         calibrationIdentifier: String? = nil, shouldFallback: @escaping @MainActor (InferenceRoute, any Error) -> Bool,
         cloudPermission: @escaping @MainActor (Bool) -> Bool = { _ in true },
+        localPermission: @escaping @MainActor () -> Bool = { true },
         continuation: AsyncThrowingStream<RoutingStreamEvent<Value>, any Error>.Continuation,
         cloud: @escaping @MainActor () async throws -> RoutingProviderStream<Value>?,
         onDevice: @escaping @MainActor () async throws -> RoutingProviderStream<Value>
@@ -84,7 +85,7 @@ extension AdaptiveRouter {
         return try await performDetailed(context: context, inputTokens: inputTokens, localContextCapacity: localContextCapacity,
             policy: policy, workload: workload, availability: availability, calibrationIdentifier: calibrationIdentifier,
             onDecision: { continuation.yield(.selected($0)) }, canFallback: { !published },
-            shouldFallback: shouldFallback, cloudPermission: cloudPermission,
+            shouldFallback: shouldFallback, cloudPermission: cloudPermission, localPermission: localPermission,
             onProbeFallback: { value, route in
                 if case .terminated = continuation.yield(.update(value, route: route)) { throw CancellationError() }
                 published = true
@@ -107,6 +108,7 @@ extension AdaptiveRouter {
         didPublish: () -> Void
     ) async throws -> Value? {
         let result: Result<Value?, any Error>
+        var cancelProducer = false
         do {
             var last: Value?
             for try await value in source.stream {
@@ -120,12 +122,15 @@ extension AdaptiveRouter {
             result = .success(last)
         } catch {
             if route == .cloud { recordRetryDeadline(error) }
+            cancelProducer = true
             result = .failure(error)
         }
         // A cancelled iterator can finish before a noncooperative producer returns its server reset date.
-        if let error = await source.finishProducer(), route == .cloud { recordRetryDeadline(error) }
+        let producerError = await source.finishProducer(cancelling: cancelProducer)
+        if let producerError, route == .cloud { recordRetryDeadline(producerError) }
         let value = try result.get()
         try context.checkActive()
+        if let producerError { throw producerError }
         return value
     }
 }

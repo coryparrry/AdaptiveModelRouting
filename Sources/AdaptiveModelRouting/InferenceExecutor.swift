@@ -39,7 +39,7 @@ public nonisolated enum InferenceExecutor {
     @MainActor
     static func execute<Value>(preferred: InferenceRoute, canUseLocalWhole: Bool, policy: RoutingPolicy,
         canFallback: () -> Bool, shouldFallback: (InferenceRoute, any Error) -> Bool,
-        cloud: () async throws -> Value?, onDevice: () async throws -> Value
+        cloud: () async throws -> Value?, onDevice: () async throws -> Value?
     ) async throws -> Value? {
         try Task.checkCancellation()
         if policy == .localOnly {
@@ -51,7 +51,7 @@ public nonisolated enum InferenceExecutor {
             do {
                 let value = try await onDevice()
                 try Task.checkCancellation()
-                return value
+                if let value { return value }
             } catch is CancellationError { throw CancellationError() }
             catch {
                 try Task.checkCancellation()
@@ -60,9 +60,10 @@ public nonisolated enum InferenceExecutor {
                 try Task.checkCancellation()
                 guard retry, canFallback() else { throw error }
                 try Task.checkCancellation()
-                return try await finalAttempt(model: .cloud, shouldFallback: shouldFallback, operation: cloud)
             }
+            return try await finalAttempt(model: .cloud, shouldFallback: shouldFallback, operation: cloud)
         }
+        var cloudError: (any Error)?
         do {
             let value = try await cloud()
             try Task.checkCancellation()
@@ -74,11 +75,13 @@ public nonisolated enum InferenceExecutor {
             let retry = shouldFallback(.cloud, error)
             try Task.checkCancellation()
             guard retry, policy != .cloudRequired, canUseLocalWhole, canFallback() else { throw error }
-            try Task.checkCancellation()
+            cloudError = error
         }
         try Task.checkCancellation()
         guard policy != .cloudRequired, canUseLocalWhole else { return nil }
-        return try await finalAttempt(model: .onDevice, shouldFallback: shouldFallback, operation: onDevice)
+        let value = try await finalAttempt(model: .onDevice, shouldFallback: shouldFallback, operation: onDevice)
+        if value == nil, let cloudError { throw cloudError }
+        return value
     }
 
     /// Reports the final lane's health without retrying an already attempted provider.

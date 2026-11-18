@@ -381,7 +381,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         XCTAssertEqual(result.value, "local")
         XCTAssertEqual(result.decision.reason, .localOnly)
         XCTAssertFalse(result.availability.cloud)
-        XCTAssertEqual(backend.inspectedPolicies, [.localOnly, .localOnly])
+        XCTAssertEqual(backend.inspectedPolicies, [.localOnly, .localOnly, .localOnly])
         backend.localError = URLError(.timedOut)
         do {
             _ = try await router.respond(to: "Private summary", policy: .localOnly)

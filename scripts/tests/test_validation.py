@@ -73,6 +73,43 @@ class RunnerTests(unittest.TestCase):
             summary = json.loads((root / "summary.json").read_text())
             self.assertEqual([step["exitCode"] for step in summary], [0, 3])
 
+    def test_failed_preflight_replaces_existing_passing_summary(self):
+        """A later run's SDK failure replaces previous success and is visible before any stage runs."""
+        with tempfile.TemporaryDirectory() as folder, patch.object(sys, "argv", ["validate", "--artifacts", folder]):
+            summary = Path(folder) / "summary.json"
+            summary.write_text(json.dumps([{"step": "old run", "exitCode": 0}]))
+
+            def old_sdk(*args, **kwargs):
+                """Check that machine readers can identify the new active run even during SDK lookup."""
+                self.assertEqual(json.loads(summary.read_text())[-1]["status"], "running")
+                return "26.0"
+
+            with patch.object(validate.subprocess, "check_output", side_effect=old_sdk):
+                with self.assertRaises(SystemExit):
+                    validate.main()
+            rows = json.loads(summary.read_text())
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "failed")
+            self.assertEqual(rows[0]["exitCode"], 1)
+            self.assertIn("Xcode 27", rows[0]["detail"])
+
+    def test_interrupt_after_passed_stage_is_marked_incomplete(self):
+        """An interrupted validation retains its completed stages together with the terminal status."""
+        with tempfile.TemporaryDirectory() as folder, patch.object(sys, "argv", ["validate", "--artifacts", folder]):
+            def interrupt(args, artifacts, results):
+                """Pass a real harmless stage and interrupt before the next one."""
+                validate.run_step("early", [sys.executable, "-c", "pass"], artifacts, os.environ.copy(), results)
+                self.assertEqual(json.loads((artifacts / "summary.json").read_text())[-1]["status"], "running")
+                raise KeyboardInterrupt()
+
+            with patch.object(validate, "validate", side_effect=interrupt), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(KeyboardInterrupt):
+                    validate.main()
+            early, final = json.loads((Path(folder) / "summary.json").read_text())
+            self.assertEqual(early["exitCode"], 0)
+            self.assertEqual(final["status"], "interrupted")
+            self.assertEqual(final["exitCode"], 130)
+
     def test_early_failure_survives_long_success_tail(self):
         """Hosted logs retain attributed failures even when later passing tests push them out of the tail."""
         lines = ["Example.swift:42: error: missing asynchronous signal"] + [f"passed case {i}" for i in range(100)]

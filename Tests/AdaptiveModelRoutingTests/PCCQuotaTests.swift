@@ -16,6 +16,9 @@ final class PCCQuotaTests: XCTestCase {
         var availability = RoutingAvailability(cloudQuota: .available)
         var localContextCapacity = 8_192
         var tokenProvider: ControlledRoutingProvider?
+        var cloudProvider: ControlledRoutingProvider?
+        var cloudError: URLError?
+        var localReadiness: [Bool] = []
         var sequence: [CloudQuotaStatus] = []
         var routes: [InferenceRoute] = []
         var tokenCalls = 0
@@ -24,9 +27,11 @@ final class PCCQuotaTests: XCTestCase {
         /// Replays provider quota observations in order while honoring hard policy isolation.
         func availability(for policy: RoutingPolicy) -> RoutingAvailability {
             policies.append(policy)
+            let local = policy != .cloudRequired
+                && (localReadiness.isEmpty ? availability.onDevice : localReadiness.removeFirst())
+            if policy == .localOnly { return .init(onDevice: local, cloud: false) }
             let quota = sequence.isEmpty ? availability.cloudQuota : sequence.removeFirst()
-            return .init(onDevice: policy != .cloudRequired && availability.onDevice,
-                cloud: policy != .localOnly && availability.cloud, cloudQuota: quota)
+            return .init(onDevice: local, cloud: availability.cloud, cloudQuota: quota)
         }
 
         /// Can suspend the exact asynchronous preflight boundary where a quota snapshot becomes stale.
@@ -39,6 +44,10 @@ final class PCCQuotaTests: XCTestCase {
         /// Records actual generation separately from availability/readiness inspection.
         func text(route: InferenceRoute, prompt: String, instructions: String?, options: GenerationOptions) async throws -> String {
             routes.append(route)
+            if route == .cloud {
+                if let cloudProvider { _ = await cloudProvider.call() }
+                if let cloudError { throw cloudError }
+            }
             return route.rawValue
         }
 
@@ -116,6 +125,77 @@ final class PCCQuotaTests: XCTestCase {
             XCTAssertEqual(backend.policies, [.localOnly, .localOnly])
             XCTAssertEqual(backend.tokenCalls, 1)
             XCTAssertTrue(core.profile.failures.isEmpty)
+        }
+    }
+
+    /// Losing local readiness while cloud is running preserves its failure without a second provider call.
+    func testUnavailableLocalFallbackPreservesCloudFailure() async throws {
+        for format in 0..<4 {
+            let backend = Backend()
+            let cloud = ControlledRoutingProvider()
+            backend.cloudProvider = cloud
+            backend.cloudError = URLError(.networkConnectionLost)
+            let core = singleProviderRouter(monitorConnection: false, persistence: .memoryOnly)
+            let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+            let request = Task { try await self.invoke(router, format: format) }
+            await cloud.started.wait()
+            backend.availability = .init(onDevice: false, cloud: true)
+            cloud.release()
+            do {
+                _ = try await request.value
+                XCTFail("Expected the cloud failure, format=\(format)")
+            } catch let error as URLError {
+                XCTAssertEqual(error.code, .networkConnectionLost)
+            }
+            XCTAssertEqual(backend.routes, [.cloud])
+            XCTAssertEqual(core.profile.failures.map(\.model), [.cloud])
+        }
+    }
+
+    /// A paired request can finish on cloud when the local probe loses readiness after preflight.
+    func testDeferredLocalCalibrationRechecksReadiness() async throws {
+        for format in 0..<4 {
+            let backend = Backend()
+            backend.localReadiness = [true, true] // Ready before and after tokenization.
+            backend.availability = .init(onDevice: false, cloud: true)
+            let core = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+            let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+            let route = try await invoke(router, format: format)
+            await router.waitForCalibration()
+            XCTAssertEqual(route, .cloud, "format=\(format)")
+            XCTAssertTrue(backend.policies.contains(.localOnly), "The scheduled probe checked local readiness.")
+            XCTAssertEqual(backend.routes, [.cloud])
+            XCTAssertFalse(core.profile.samples.contains { $0.model == .onDevice })
+            XCTAssertTrue(core.profile.failures.isEmpty)
+        }
+    }
+
+    /// Successful cloud-required generation restores route health without training on an unknown token count.
+    func testCloudRequiredZeroTokenSuccessRestoresAutomaticRouting() async throws {
+        for format in 0..<4 {
+            let backend = Backend()
+            backend.cloudError = URLError(.timedOut)
+            let core = singleProviderRouter(monitorConnection: false, persistence: .memoryOnly)
+            let router = FoundationModelsRouter(router: core, options: .init(), backend: backend)
+            do {
+                _ = try await invoke(router, format: format, policy: .cloudRequired)
+                XCTFail("Expected the initial cloud failure, format=\(format)")
+            } catch let error as URLError {
+                XCTAssertEqual(error.code, .timedOut)
+            }
+            XCTAssertEqual(core.profile.failures.map(\.model), [.cloud])
+
+            backend.cloudError = nil
+            let recovered = try await invoke(router, format: format, policy: .cloudRequired)
+            XCTAssertEqual(recovered, .cloud)
+            XCTAssertEqual(backend.tokenCalls, 0)
+            XCTAssertTrue(core.profile.failures.isEmpty)
+            XCTAssertTrue(core.profile.samples.isEmpty)
+
+            backend.localContextCapacity = 1
+            let oversized = try await invoke(router, format: format)
+            XCTAssertEqual(oversized, .cloud, "format=\(format)")
+            XCTAssertEqual(backend.routes, [.cloud, .cloud, .cloud])
         }
     }
 

@@ -14,6 +14,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+if __package__:
+    from .process_groups import stop_process
+else:
+    from process_groups import stop_process
+
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -63,8 +69,8 @@ def mutations() -> list[dict]:
          "edits": [(coordinator, "await probe.waitForWorker()", "// deliberately omit actual worker join")]},
         {"name": "release-slot-before-stream-producer-exits", "filter": "FoundationModelsRouterTests.testStreamingProbeTimeoutRetainsActualProducerSlot",
          "edits": [("Sources/AdaptiveModelRouting/Streaming.swift",
-                    "if let error = await source.finishProducer(), route == .cloud { recordRetryDeadline(error) }",
-                    "// deliberately omit actual stream producer join")]},
+                    "let producerError = await source.finishProducer(cancelling: cancelProducer)",
+                    "let producerError: (any Error)? = nil")]},
         {"name": "leave-probe-running-after-parent-cancel", "filter": "PairedCalibrationTests.testForegroundCancellationCancelsProbe",
          "edits": [(core, "context.onAbort = { probe.cancel() }", "context.onAbort = {}") ]},
         {"name": "allow-fallback-after-partial-output", "filter": "CostOwnedStreamTests.testOwnedPartialOutputNeverSwitchesProviders",
@@ -79,7 +85,7 @@ def mutations() -> list[dict]:
          "edits": [("Sources/AdaptiveModelRouting/RoutingResult.swift",
                     "cloud: cloud && policy != .localOnly && cloudQuota != .exhausted", "cloud: cloud && policy != .localOnly")]},
         {"name": "bypass-cloud-cooldown", "filter": "QuotaScheduleTests|QuotaPersistenceTests",
-         "edits": [(coordinator, "now.timeIntervalSince(lastCloudUse) < cloudInterval", "false")]},
+         "edits": [(coordinator, "now.timeIntervalSince(lastCloudUse) >= interval", "true")]},
         {"name": "forget-persisted-cloud-use", "filter": "QuotaPersistenceTests.testFailedCloudUseIsPersistedBeforeGenerationAndSurvivesIdentityReset",
          "edits": [(core, "lastCloudUse: calibration.lastCloudUse, cloudRetryAfter:", "lastCloudUse: nil, cloudRetryAfter:")]},
         {"name": "ignore-persisted-cloud-use", "filter": "QuotaPersistenceTests.testFailedCloudUseIsPersistedBeforeGenerationAndSurvivesIdentityReset",
@@ -135,16 +141,10 @@ def run(name: str, test_filter: str, workspace: Path, artifacts: Path, timeout: 
         try:
             code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            stop_process(process)
             code = 124
         except BaseException:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
+            stop_process(process)
             raise
     text = log.read_text(errors="replace")
     killed = detected_fault(code, text, test_filter)
@@ -210,4 +210,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     main()

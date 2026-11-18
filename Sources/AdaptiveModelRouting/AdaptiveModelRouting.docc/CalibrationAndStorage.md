@@ -101,7 +101,9 @@ Memory-only initialization never loads or writes a calibration file. Switching t
 
 Reset rejects a directory at the reserved `latency.json` path and preserves its contents. It also preserves unrelated sibling files. Requests already in flight can still return their outputs, but their old measurements cannot repopulate a reset profile.
 
-Storage failures are optional calibration failures, not inference failures. Inspect ``RoutingStorageStatus`` to distinguish memory-only, persisted, unavailable and preserved-cache states.
+If a disk cache is temporarily inaccessible, such as before first unlock, the router can still use a permitted local model. Router-managed cloud dispatch waits until the owner can check the saved pacing metadata. The next disk read retries automatically. Resetting a disk-backed profile or explicitly clearing the cache while that read still fails throws the filesystem error and preserves the file.
+
+Use `setPersistence(.memoryOnly, clearExistingCache: false)` to stop disk access immediately, even while the file is locked. Requests that finish later can update only memory. If the owner detached with unread pacing metadata, its managed cloud requests stay unavailable until you explicitly reenable disk access and the owner checks the saved state. Malformed or unsupported files remain preserved until an explicit reset. Inspect ``RoutingStorageStatus`` to distinguish memory-only, persisted, unavailable and preserved-cache states.
 
 ## Invalidate changed work
 
@@ -113,7 +115,7 @@ For provider closures, pass `calibrationIdentifier:` when constructing ``Adaptiv
 
 ## Stored metadata
 
-The backup-excluded cache holds the most recent cloud-use timestamp and bounded provider timing samples, input and expected-output token counts, session flags, coarse network flags, timestamps, OS version and an opaque identity digest. It does not hold prompts, generated output, raw instructions, raw model identifiers or raw provider errors. No built-in telemetry is sent.
+The router marks its own cache file as excluded from backup on every atomic replacement. The containing directory and unrelated files keep their existing backup settings. Apps that supplied a shared directory to an older version should check its existing backup setting, since earlier versions marked the directory itself. The cache holds the most recent cloud-use timestamp and bounded provider timing samples, input and expected-output token counts, session flags, coarse network flags, timestamps, OS version and an opaque identity digest. It does not hold prompts, generated output, raw instructions, raw model identifiers or raw provider errors. No built-in telemetry is sent.
 
 Default cache directories include a hashed host-app identity, so unsandboxed apps do not accidentally share the same workload's file. Legacy shared default paths are preserved rather than deleted; they start fresh calibration under the app namespace. Explicit custom directories retain their caller-owned location.
 

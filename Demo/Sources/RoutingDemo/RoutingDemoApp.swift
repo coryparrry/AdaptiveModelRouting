@@ -18,6 +18,7 @@ struct RoutingDemoApp: App {
 struct RoutingDemoView: View {
     @Bindable var model: DemoModel
     @State private var advanced = false
+    @State private var windowID = UUID()
 
     var body: some View {
         ScrollView {
@@ -34,7 +35,8 @@ struct RoutingDemoView: View {
             .frame(maxWidth: 1_000, alignment: .leading)
         }
         .frame(minWidth: 600, minHeight: 640)
-        .onDisappear { model.cancel() }
+        .onAppear { model.windowAppeared(windowID) }
+        .onDisappear { model.windowDisappeared(windowID) }
     }
 
     private var request: some View {

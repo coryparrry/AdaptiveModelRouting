@@ -130,8 +130,8 @@ final class QuotaEligibilityTests: XCTestCase {
         }
     }
 
-    /// New quota pressure cancels only optional cloud work while retaining its execution slot until exit.
-    func testQuotaWarningStopsAnAlreadyRunningCloudProbe() async throws {
+    /// A private request arriving before promotion leaves the existing automatic caller's recovery available.
+    func testLocalOnlyRequestBeforeFallbackPreservesRunningProbe() async throws {
         let profiles = try CostProfiles(cloudAge: 601)
         defer { profiles.cleanup() }
         let scenario = CostScenario(policy: .automatic, paired: true, training: .localFaster,
@@ -140,19 +140,71 @@ final class QuotaEligibilityTests: XCTestCase {
         let cloud = ControlledRoutingProvider()
         var cloudCalls = 0
         defer { cloud.release(); router.cancelCalibration() }
-        let _: String? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
-            workload: profiles.workload, cloud: { cloudCalls += 1; return await cloud.call() }, onDevice: { "local" })
-        await cloud.started.wait()
-        let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
-            workload: profiles.workload, availability: .init(cloudQuota: .approachingLimit),
-            cloud: { cloudCalls += 1; return "unexpected cloud" }, onDevice: { "local" })
-        await router.waitForCalibration()
-        XCTAssertEqual(result.route, .onDevice)
-        XCTAssertEqual(result.decision.reason, .cloudQuotaConserved)
+        let result: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+            workload: profiles.workload, cloud: { cloudCalls += 1; return await cloud.call() }, onDevice: {
+                await cloud.started.wait()
+                let second = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                    policy: .localOnly, workload: profiles.workload,
+                    cloud: { XCTFail("The private request must remain local."); return "unexpected" },
+                    onDevice: { "private" })
+                XCTAssertEqual(second.value, "private")
+                cloud.release("recovered")
+                throw URLError(.networkConnectionLost)
+            })
+        XCTAssertEqual(result.value, "recovered")
+        XCTAssertEqual(result.attempts.map(\.route), [.onDevice, .cloud])
         XCTAssertEqual(cloudCalls, 1)
-        XCTAssertEqual(router.lastCalibrationAttempt?.outcome, .cancelled)
-        XCTAssertTrue(router.isCalibrating)
-        cloud.release()
-        await cloud.finished.wait()
+    }
+
+    /// Intervening cloud use blocks the queued optional call while still allowing a genuine foreground retry.
+    func testQueuedCloudProbeRechecksCooldownWithoutBlockingRecovery() async throws {
+        for localFails in [false, true] {
+            let profiles = try CostProfiles(cloudAge: 601)
+            defer { profiles.cleanup() }
+            let scenario = CostScenario(policy: .automatic, paired: true, training: .localFaster,
+                localReady: true, cloudReady: true, offline: false, capacity: 8_192, cloud: .success, local: .success)
+            let router = try profiles.router(scenario)
+            var cloudCalls = 0
+            let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                workload: profiles.workload, cloud: { cloudCalls += 1; return "recovered" }, onDevice: {
+                    XCTAssertTrue(router.isCalibrating)
+                    _ = try await router.measure(model: .cloud, inputTokens: 100, snapshot: router.snapshot()) { "other request" }
+                    if localFails { throw URLError(.networkConnectionLost) }
+                    return "local"
+                })
+            await router.waitForCalibration()
+            XCTAssertEqual(result.value, localFails ? "recovered" : "local")
+            XCTAssertEqual(cloudCalls, localFails ? 1 : 0)
+            XCTAssertEqual(result.attempts.map(\.route), localFails ? [.onDevice, .cloud] : [.onDevice])
+            XCTAssertNil(router.lastCalibrationAttempt, "A skipped optional call has no provider attempt.")
+        }
+    }
+
+    /// New quota pressure cancels only optional cloud work while retaining its execution slot until exit.
+    func testQuotaWarningStopsAnAlreadyRunningCloudProbe() async throws {
+        for policy in [RoutingPolicy.automatic, .localOnly] {
+            let profiles = try CostProfiles(cloudAge: 601)
+            defer { profiles.cleanup() }
+            let scenario = CostScenario(policy: .automatic, paired: true, training: .localFaster,
+                localReady: true, cloudReady: true, offline: false, capacity: 8_192, cloud: .success, local: .success)
+            let router = try profiles.router(scenario)
+            let cloud = ControlledRoutingProvider()
+            var cloudCalls = 0
+            defer { cloud.release(); router.cancelCalibration() }
+            let _: String? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
+                workload: profiles.workload, cloud: { cloudCalls += 1; return await cloud.call() }, onDevice: { "local" })
+            await cloud.started.wait()
+            let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                policy: policy, workload: profiles.workload, availability: .init(cloudQuota: .approachingLimit),
+                cloud: { cloudCalls += 1; return "unexpected cloud" }, onDevice: { "local" })
+            await router.waitForCalibration()
+            XCTAssertEqual(result.route, .onDevice)
+            XCTAssertEqual(result.decision.reason, policy == .localOnly ? .localOnly : .cloudQuotaConserved)
+            XCTAssertEqual(cloudCalls, 1)
+            XCTAssertEqual(router.lastCalibrationAttempt?.outcome, .cancelled)
+            XCTAssertTrue(router.isCalibrating)
+            cloud.release()
+            await cloud.finished.wait()
+        }
     }
 }
