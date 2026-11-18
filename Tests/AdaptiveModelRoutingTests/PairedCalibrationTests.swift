@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import AdaptiveModelRouting
@@ -113,6 +114,45 @@ final class PairedCalibrationTests: XCTestCase {
         XCTAssertEqual(classifications, 1)
         XCTAssertEqual(localCalls, 1)
         XCTAssertEqual(router.profile.samples.filter { $0.model == .onDevice }.count, 1)
+    }
+
+    /// A probe expiring in the queue leaves the local provider available to an unlimited request.
+    func testQueuedProbeTimeoutAllowsForegroundFallback() async throws {
+        let router = router(timeout: .milliseconds(10))
+        var localCalls = 0
+        let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+            deadline: .unlimited, cloud: {
+                // Keep the main actor busy so the queued probe cannot start before its cutoff.
+                usleep(50_000)
+                throw URLError(.networkConnectionLost)
+            }, onDevice: { localCalls += 1; return "recovered" })
+        await router.waitForCalibration()
+        XCTAssertEqual(result.value, "recovered")
+        XCTAssertEqual(result.attempts.map(\.route), [.cloud, .onDevice])
+        XCTAssertEqual(result.attempts.map(\.outcome), [.failed, .succeeded])
+        XCTAssertEqual(localCalls, 1)
+        XCTAssertNil(router.lastCalibrationAttempt)
+    }
+
+    /// A provider that actually ran and reported a timeout cannot be dispatched a second time.
+    func testDispatchedProbeTimeoutDoesNotRepeatProvider() async throws {
+        let router = router()
+        var localCalls = 0
+        var attempts: [RoutingAttempt] = []
+        do {
+            let _: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                deadline: .unlimited, onAttempt: { attempts.append($0) }, cloud: {
+                    await router.waitForCalibration()
+                    throw URLError(.networkConnectionLost)
+                }, onDevice: {
+                    localCalls += 1
+                    throw RoutingRequestError.deadlineExceeded
+                })
+            XCTFail("The dispatched provider's timeout must reach the caller.")
+        } catch RoutingRequestError.deadlineExceeded {}
+        XCTAssertEqual(localCalls, 1)
+        XCTAssertEqual(attempts.map(\.route), [.cloud, .onDevice])
+        XCTAssertEqual(attempts.map(\.outcome), [.failed, .timedOut])
     }
 
     /// Shadow failures leave the selected answer intact and apply health backoff without retrying.

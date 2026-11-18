@@ -33,6 +33,7 @@ public final class AdaptiveRouter {
 
     public private(set) var profile = PerformanceProfile()
     private var cloudRetryAfter: Date?
+    private var lastKnownCloudQuota: CloudQuotaStatus = .unknown
     private var connection = PerformanceProfile.Connection(kind: .unknown)
     private var generation = 0
     private var profileGeneration = 0
@@ -46,7 +47,7 @@ public final class AdaptiveRouter {
     var onConnectionObservation: ((RoutingConnectionObservation) -> Void)?
     private let directory: URL
     private let system: String
-    public let configuration: RoutingConfiguration
+    public private(set) var configuration: RoutingConfiguration
     private let monitor: NWPathMonitor?
     /// Separates normal storage, deliberately preserved bytes and a file awaiting another read.
     private enum CacheAccess {
@@ -97,6 +98,16 @@ public final class AdaptiveRouter {
     public func waitForCalibration() async { await calibration.wait() }
     /// Stops background inference when the app no longer wants to spend calibration resources.
     public func cancelCalibration() { calibration.cancel() }
+
+    /// Applies a preset's latency margins, variability allowance and sample-count settings to future decisions.
+    /// Keeps provider pacing, calibration history and the router's existing execution and storage policies.
+    public func updateSelectionThresholds(from preset: RoutingConfiguration) {
+        configuration = .init(customizing: configuration,
+            minimumLocalSavingSeconds: preset.minimumLocalSavingSeconds,
+            minimumLocalSavingFraction: preset.minimumLocalSavingFraction,
+            minimumSamples: preset.minimumSamples, predictionSampleLimit: preset.predictionSampleLimit,
+            variabilityAllowance: preset.variabilityAllowance)
+    }
 
     /// Captures coarse path identity and request generation without retaining network names.
     public func snapshot() -> Snapshot { Snapshot(connection: connection, generation: generation, profileGeneration: profileGeneration) }
@@ -174,11 +185,14 @@ public final class AdaptiveRouter {
         onDevice: @escaping @MainActor (RoutingRequestContext, Bool) async throws -> Value
     ) async throws -> RoutingResult<Value> {
         try context.checkActive()
+        if availability.cloudQuota != .unknown { lastKnownCloudQuota = availability.cloudQuota }
         let availability = providerAvailability(availability, now: .now)
             .restricted(to: policy, conserveQuota: configuration.conserveCloudQuota)
         let suppliedCloudPermission = cloudPermission
-        let cloudPermission: @MainActor (Bool) -> Bool = { calibration in
-            self.permitsCloud(now: .now) && suppliedCloudPermission(calibration)
+        let cloudPermission: @MainActor (Bool) -> Bool = { isCalibration in
+            let current = self.providerAvailability(.init(), now: .now)
+                .restricted(to: policy, conserveQuota: self.configuration.conserveCloudQuota)
+            return current.cloud && (!isCalibration || current.permitsCloudCalibration) && suppliedCloudPermission(isCalibration)
         }
         if availability.hasCloudQuotaPressure || (policy != .localOnly && !availability.cloud) {
             calibration.cancelCloudProbe()
@@ -236,17 +250,18 @@ public final class AdaptiveRouter {
             probe = try RoutingProbe(route: route, deadline: .after(min(timeout, remaining)),
                 onAttempt: { [calibration] in calibration.record($0) }) { probeContext in
                     do {
-                        if route == .cloud && !cloudPermission(true) { return nil }
-                        if route == .cloud && !self.calibration.permitsOptionalCloud(interval: self.configuration.cloudRetryInterval) {
-                            return nil
-                        }
-                        if route == .onDevice && !localPermission() { return nil }
+                        if route == .cloud {
+                            guard cloudPermission(true),
+                                  self.calibration.permitsOptionalCloud(interval: self.configuration.cloudRetryInterval) else { return nil }
+                            try probeContext.checkActive()
+                            self.calibration.recordCloudUse()
+                            // Persist the reservation before timing the provider. If storage uses up the
+                            // probe budget, track rejects dispatch without recording a provider attempt.
+                            self.save()
+                        } else if !localPermission() { return nil }
                         return try await self.track(model: route, inputTokens: inputTokens, snapshot: snapshot,
                             workload: workload, context: probeContext, comparisonID: pairID, available: { $0 != nil }) {
                                 if route == .cloud {
-                                    self.calibration.recordCloudUse()
-                                    self.save()
-                                    try probeContext.checkActive()
                                     return try await cloud(probeContext, true)
                                 }
                                 return try await onDevice(probeContext, true)
@@ -311,6 +326,13 @@ public final class AdaptiveRouter {
             context.finishAttempt(value == nil ? .unavailable : .succeeded)
             return .returned(value)
         } catch {
+            // A queued probe can exhaust its own budget before it starts a provider attempt.
+            // Leave fallback to the foreground dispatch path, which rechecks provider eligibility.
+            if (error as? RoutingRequestError) == .deadlineExceeded, probe.context.attempts.isEmpty,
+               (try? context.checkActive()) != nil {
+                context.discardUndispatchedAttempt()
+                return nil
+            }
             let error = context.effectiveError(error)
             context.finishAttempt((error as? RoutingRequestError) == .deadlineExceeded ? .timedOut
                 : (error is CancellationError || Task.isCancelled ? .cancelled : .failed))
@@ -483,9 +505,10 @@ public final class AdaptiveRouter {
         return cloudRetryAfter.map { now >= $0 } ?? true
     }
 
-    /// Masks cloud readiness while a known server reset deadline remains in the future.
+    /// Applies server retry pacing and uses the last explicit quota signal when a request supplies none.
     private func providerAvailability(_ value: RoutingAvailability, now: Date) -> RoutingAvailability {
-        .init(onDevice: value.onDevice, cloud: value.cloud && permitsCloud(now: now), cloudQuota: value.cloudQuota)
+        .init(onDevice: value.onDevice, cloud: value.cloud && permitsCloud(now: now),
+            cloudQuota: value.cloudQuota == .unknown ? lastKnownCloudQuota : value.cloudQuota)
     }
 
     /// Keeps the longest finite provider retry hint without storing an error message or response content.

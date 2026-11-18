@@ -152,8 +152,8 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(reopened.storageLabel, "In memory")
     }
 
-    /// Editing the next request's deadline keeps learned timings and the active provider-wide retry date.
-    func testDeadlineEditPreservesInMemoryTimingsAndCloudThrottle() async throws {
+    /// Verifies a settings change through a cloud-required request after one local sample and a server throttle.
+    private func assertEditPreservesInMemoryTimingsAndCloudThrottle(_ edit: (DemoModel) -> Void) async throws {
         let (model, root) = model()
         defer { try? FileManager.default.removeItem(at: root) }
         model.start()
@@ -166,14 +166,35 @@ final class DemoModelTests: XCTestCase {
             XCTFail("Expected the provider throttle")
         } catch LanguageModelError.rateLimited {}
 
-        model.deadlineSeconds = 1
+        edit(model)
         XCTAssertTrue(model.activeRouter === router)
         XCTAssertEqual(model.activeRouter.profile.samples.count, 1)
+        XCTAssertEqual(model.sampleCount, 1)
         model.policy = .cloud
         model.start()
         await model.waitUntilFinished()
         XCTAssertEqual(model.status, "No permitted model is available")
         XCTAssertTrue(model.attempts.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    /// Editing the next request's deadline keeps learned timings and the active provider-wide retry date.
+    func testDeadlineEditPreservesInMemoryTimingsAndCloudThrottle() async throws {
+        try await assertEditPreservesInMemoryTimingsAndCloudThrottle { $0.deadlineSeconds = 1 }
+    }
+
+    /// Switching presets applies the selected thresholds while retaining the same history and server throttle.
+    func testPresetChangePreservesInMemoryTimingsAndCloudThrottle() async throws {
+        try await assertEditPreservesInMemoryTimingsAndCloudThrottle { model in
+            model.preset = .quality
+            let configuration = model.activeRouter.configuration
+            let preset = DemoPreset.quality.value
+            XCTAssertEqual(configuration.minimumLocalSavingSeconds, preset.minimumLocalSavingSeconds)
+            XCTAssertEqual(configuration.minimumLocalSavingFraction, preset.minimumLocalSavingFraction)
+            XCTAssertEqual(configuration.minimumSamples, preset.minimumSamples)
+            XCTAssertEqual(configuration.predictionSampleLimit, preset.predictionSampleLimit)
+            XCTAssertEqual(configuration.variabilityAllowance, preset.variabilityAllowance)
+        }
     }
 
     /// Seeds qualified simulated local timings, then returns while the slower cloud probe is active.
@@ -204,6 +225,19 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Completed on device")
     }
 
+    /// A preset edit cancels optional work from the previous selection while preserving its admitted samples.
+    func testPresetChangeCancelsPostResponseCalibration() async {
+        let (model, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        await finishForegroundWithRunningProbe(model)
+        let samples = model.sampleCount
+        model.preset = .balanced
+        await model.activeRouter.waitForCalibration()
+        XCTAssertFalse(model.canCancel)
+        XCTAssertEqual(model.activeRouter.lastCalibrationAttempt?.outcome, .cancelled)
+        XCTAssertEqual(model.sampleCount, samples)
+    }
+
     /// Completing a healthy late probe updates observed controls and displays the extra timing automatically.
     func testCompletedCalibrationRefreshesDisplayedTimingCount() async {
         let (model, root) = model()
@@ -220,14 +254,14 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.activeRouter.lastCalibrationAttempt?.outcome, .succeeded)
     }
 
-    /// Changing a preset cancels the old background probe and prevents late work overwriting the new owner's file.
-    func testReconfigurationRetiresDiskOwnerAfterForegroundCompletion() async throws {
+    /// Changing provider mode cancels the old background probe and prevents late writes to its disk cache.
+    func testModeChangeRetiresDiskOwnerAfterForegroundCompletion() async throws {
         let (model, root) = model()
         defer { try? FileManager.default.removeItem(at: root) }
         model.setPersistence(true)
         await finishForegroundWithRunningProbe(model)
         let oldRouter = model.activeRouter
-        model.preset = .balanced
+        model.mode = .apple
         XCTAssertFalse(oldRouter === model.activeRouter)
         await oldRouter.waitForCalibration()
         XCTAssertEqual(oldRouter.lastCalibrationAttempt?.outcome, .cancelled)

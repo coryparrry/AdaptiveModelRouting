@@ -77,7 +77,7 @@ private struct DemoStoragePreferences: Codable {
     }
 }
 
-/// Retains exactly one router owner for the current mode and configuration.
+/// Retains one router owner for the current provider mode across preset changes.
 @MainActor
 private enum DemoRoutingOwner {
     case simulated(AdaptiveRouter)
@@ -102,7 +102,11 @@ public final class DemoModel {
     }
     public var policy: DemoPolicy = .local
     public var preset: DemoPreset = .fastest {
-        didSet { if preset != oldValue { replaceOwner() } }
+        didSet {
+            guard preset != oldValue else { return }
+            cancel()
+            activeRouter.updateSelectionThresholds(from: preset.value)
+        }
     }
     public var fault: DemoFault = .none
     public var deadlineSeconds = 5.0

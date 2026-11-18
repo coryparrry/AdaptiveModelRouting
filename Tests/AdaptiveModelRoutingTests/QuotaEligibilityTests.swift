@@ -5,6 +5,41 @@ import XCTest
 /// Makes quota preservation an explicit eligibility contract across all core generation entry points.
 @MainActor
 final class QuotaEligibilityTests: XCTestCase {
+    /// A newer quota signal reaches a pending fallback even when neither request owns a calibration probe.
+    func testSingleProviderFallbackHonorsInterveningQuotaUntilExplicitRecovery() async throws {
+        let router = AdaptiveRouter(monitorConnection: false, configuration: .init(calibration: .singleProvider),
+            persistence: .memoryOnly)
+        router.updateConnection(.init(kind: .offline))
+        var cloudCalls = 0
+        var attempts: [RoutingAttempt] = []
+        do {
+            let _: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                availability: .init(cloudQuota: .available), onAttempt: { attempts.append($0) },
+                cloud: { cloudCalls += 1; return "unexpected" }, onDevice: {
+                    let signal = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                        policy: .localOnly, availability: .init(cloudQuota: .exhausted),
+                        cloud: { cloudCalls += 1; return "unexpected" }, onDevice: { "private" })
+                    XCTAssertEqual(signal.route, .onDevice)
+                    throw URLError(.networkConnectionLost)
+                })
+            XCTFail("The original local failure should reach the caller.")
+        } catch let error as URLError { XCTAssertEqual(error.code, .networkConnectionLost) }
+        XCTAssertEqual(attempts.map(\.route), [.onDevice])
+        XCTAssertEqual(attempts.map(\.outcome), [.failed])
+
+        let blocked = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+            policy: .cloudRequired, cloud: { cloudCalls += 1; return "unexpected" }, onDevice: { "local" })
+        XCTAssertEqual(blocked.availability.cloudQuota, .exhausted)
+        XCTAssertEqual(blocked.status, .unavailable)
+        XCTAssertEqual(cloudCalls, 0)
+
+        let recovered = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+            policy: .cloudRequired, availability: .init(cloudQuota: .available),
+            cloud: { cloudCalls += 1; return "recovered" }, onDevice: { "local" })
+        XCTAssertEqual(recovered.value, "recovered")
+        XCTAssertEqual(cloudCalls, 1)
+    }
+
     /// Exhausted quota always blocks cloud; automatic conservation and optional calibration also respect warnings.
     func testQuotaEligibilityMatrix() async throws {
         let profiles = try CostProfiles(cloudAge: 601)

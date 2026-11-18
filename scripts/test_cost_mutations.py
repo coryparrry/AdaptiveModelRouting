@@ -93,7 +93,7 @@ def mutations() -> list[dict]:
         {"name": "bypass-final-quota-check", "filter": "PCCQuotaTests.testQuotaChangesImmediatelyBeforeGenerationAreRechecked",
          "edits": [(core, "guard cloudPermission(false) else { return .skipped }", "guard true else { return .skipped }")]},
         {"name": "bypass-secondary-quota-check", "filter": "PCCQuotaTests.testQuotaRecheckBlocksALateOptionalPCCProbe",
-         "edits": [(core, "if route == .cloud && !cloudPermission(true) { return nil }", "if false { return nil }")]},
+         "edits": [(core, "guard cloudPermission(true),", "guard true,")]},
         {"name": "ignore-measurement-age", "filter": "RoutingAccuracyTests.testOnePCCProbeCanDetectAChangedLatencyRegime",
          "edits": [(profile, "exp2(-Double(index) - max(0, latest.timeIntervalSince(sample.date)) / configuration.predictionHalfLife)", "exp2(-Double(index))")]},
         {"name": "break-equal-timestamp-selection", "filter": "RoutingAccuracyTests.testBoundedSelectorMatchesStableSortWithShuffledDatesAndTies",

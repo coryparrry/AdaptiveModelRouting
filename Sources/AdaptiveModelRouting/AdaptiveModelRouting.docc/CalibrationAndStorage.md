@@ -81,7 +81,7 @@ Each completed pair retains a random comparison identifier and its matched local
 
 The Apple adapter reads the SDK's quota pressure status. With `conserveCloudQuota: true` (the default), automatic requests use local inference when quota is approaching its limit. Exhausted quota disables cloud for every policy. Explicit `.cloudRequired` requests can still use approaching-limit quota. Setting `conserveCloudQuota: false` opts automatic foreground work into approaching-limit use; optional cloud probes remain disabled near the limit.
 
-Quota is checked again after asynchronous tokenization and before cloud dispatch. Declining work at that check does not create a failed-provider timing or health backoff. Custom providers pass `RoutingAvailability(cloudQuota:)`; unknown means no status was supplied.
+Quota is checked again after asynchronous tokenization and before cloud dispatch. Declining work at that check does not create a failed-provider timing or health backoff. Custom providers pass `RoutingAvailability(cloudQuota:)` when making a request. The router retains the latest explicit quota status in memory, including updates from local-only requests, and consults it before dispatching a pending cloud fallback. Passing `.unknown` leaves the last observation in effect. Supply `.available` when quota recovers.
 
 The SDK exposes pressure flags rather than an exact remaining balance. The cooldown is per router/workload and does not reserve shared quota against other apps or rate-limit foreground cloud traffic. A prediction cannot guarantee the next provider's actual latency without running both: less frequent cloud probing conserves quota but delays discovery when cloud gets faster.
 
