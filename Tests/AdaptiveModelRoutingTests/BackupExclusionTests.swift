@@ -37,7 +37,7 @@ final class BackupExclusionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         XCTAssertFalse(try hasBackupExclusion(at: directory))
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for _ in 0..<2 {
             _ = try await router.measure(model: .cloud, inputTokens: 100, snapshot: router.snapshot()) { 1 }
             XCTAssertTrue(try hasBackupExclusion(at: directory))

@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import AdaptiveModelRouting
 
 /// Coordinates asynchronous tests without polling or blocking the main actor.
 @MainActor
@@ -57,4 +58,18 @@ final class ControlledRoutingProvider {
         continuation?.resume(returning: result)
         continuation = nil
     }
+}
+
+/// Preserves single-provider contracts in existing tests; paired-default behavior has a dedicated integration suite.
+@MainActor
+func singleProviderRouter(
+    directory: URL = AdaptiveRouter.defaultCacheDirectory,
+    system: String = ProcessInfo.processInfo.operatingSystemVersionString,
+    monitorConnection: Bool = true,
+    configuration: RoutingConfiguration = .balanced,
+    persistence: RoutingPersistence = .disk, calibrationIdentifier: String? = nil
+) -> AdaptiveRouter {
+    AdaptiveRouter(directory: directory, system: system, monitorConnection: monitorConnection,
+        configuration: .init(customizing: configuration, calibration: .singleProvider),
+        persistence: persistence, calibrationIdentifier: calibrationIdentifier)
 }

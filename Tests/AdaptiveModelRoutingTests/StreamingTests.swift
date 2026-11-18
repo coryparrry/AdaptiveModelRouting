@@ -6,7 +6,7 @@ import AdaptiveModelRouting
 @MainActor
 final class StreamingTests: XCTestCase {
     /// Creates a router with no model services, disk or network monitor.
-    private func router() -> AdaptiveRouter { AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly) }
+    private func router() -> AdaptiveRouter { singleProviderRouter(monitorConnection: false, persistence: .memoryOnly) }
 
     /// Creates deterministic cumulative provider snapshots and an optional terminal failure.
     private func source(_ values: [String], error: (any Error)? = nil) -> AsyncThrowingStream<String, any Error> {

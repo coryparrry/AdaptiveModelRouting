@@ -12,7 +12,7 @@ import AdaptiveModelRouting
 // In an @MainActor app model on iOS/macOS 27+:
 let router = FoundationModelsRouter(
     workload: "summaries",
-    configuration: .init(customizing: .balanced, requestDeadline: .after(.seconds(30))),
+    configuration: .init(customizing: .fastest, requestDeadline: .after(.seconds(30))),
     persistence: .memoryOnly
 )
 let summary = try await router.respond(to: transcript, policy: .localOnly)
@@ -36,6 +36,7 @@ Build with an iOS/macOS 27 SDK. Core APIs support iOS/macOS 26; the Apple adapte
 ### Routing and customization
 - ``AdaptiveRouter``
 - ``RoutingConfiguration``
+- ``RoutingCalibration``
 - ``RoutingPolicy``
 - ``RoutingWorkload``
 - ``RoutingAvailability``
@@ -44,6 +45,7 @@ Build with an iOS/macOS 27 SDK. Core APIs support iOS/macOS 26; the Apple adapte
 
 ### Streaming and request control
 - ``RoutingStreamEvent``
+- ``RoutingProviderStream``
 - ``RoutingDeadline``
 - ``RoutingRequestError``
 

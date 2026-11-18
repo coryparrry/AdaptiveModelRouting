@@ -33,14 +33,14 @@ final class AdaptiveRouterTests: XCTestCase {
         var routes: [InferenceRoute] = []
         for index in 0..<12 {
             let date = now.addingTimeInterval(Double(index))
-            let route = profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: date)
+            let route = profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: date, configuration: .init(calibration: .singleProvider))
             routes.append(route)
             profile.record(model: route, tokens: 2_000, seconds: route == .onDevice ? 0.5 : 2,
-                connection: wifi, now: date)
+                connection: wifi, now: date, configuration: .init(calibration: .singleProvider))
         }
         XCTAssertEqual(routes, Array(repeating: [.cloud, .cloud, .cloud, .onDevice], count: 3).flatMap { $0 })
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi,
-            now: now.addingTimeInterval(12)), .onDevice)
+            now: now.addingTimeInterval(12), configuration: .init(calibration: .singleProvider)), .onDevice)
     }
 
     /// Finishes bounded calibration with PCC preferred when it has the better measured performance.
@@ -48,15 +48,15 @@ final class AdaptiveRouterTests: XCTestCase {
         var profile = PerformanceProfile()
         for index in 0..<12 {
             let date = now.addingTimeInterval(Double(index))
-            let route = profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: date)
+            let route = profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: date, configuration: .init(calibration: .singleProvider))
             profile.record(model: route, tokens: 2_000, seconds: route == .onDevice ? 3 : 1,
-                connection: wifi, now: date)
+                connection: wifi, now: date, configuration: .init(calibration: .singleProvider))
         }
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi,
-            now: now.addingTimeInterval(12)), .cloud)
-        profile.recordFailure(model: .onDevice, connection: wifi, now: now.addingTimeInterval(12))
+            now: now.addingTimeInterval(12), configuration: .init(calibration: .singleProvider)), .cloud)
+        profile.recordFailure(model: .onDevice, connection: wifi, now: now.addingTimeInterval(12), configuration: .init(calibration: .singleProvider))
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: cellular,
-            now: now.addingTimeInterval(13)), .cloud)
+            now: now.addingTimeInterval(13), configuration: .init(calibration: .singleProvider)), .cloud)
     }
 
     /// A fast phone can choose local while a slower phone with the same connection chooses PCC.
@@ -71,23 +71,29 @@ final class AdaptiveRouterTests: XCTestCase {
     /// A small latency saving does not displace the preferred reasoning model.
     func testQualityPreferenceAndSparseSamplesKeepPCC() {
         XCTAssertEqual(profile(local: 1.3, cloud: 1.5).choose(
-            inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now), .cloud)
+            inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now, configuration: .balanced), .cloud)
         var sparse = PerformanceProfile()
         sparse.record(model: .onDevice, tokens: 2_000, seconds: 0.1, connection: wifi, now: now)
         sparse.record(model: .cloud, tokens: 2_000, seconds: 5, connection: wifi, now: now)
         XCTAssertEqual(sparse.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now), .cloud)
     }
 
-    /// Cellular and constrained paths do not inherit a different connection's cloud speed.
+    /// New cloud paths retain qualified local evidence while rebuilding cloud estimates through probes.
     func testSeparatesConnectionProfilesAndResetsOnPathChange() {
         var profile = profile(local: 1, cloud: 4)
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now), .onDevice)
-        XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: cellular, now: now), .cloud)
-        XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192,
-            connection: .init(kind: .wifi, constrained: true), now: now), .cloud)
+        for path in [cellular, .init(kind: .wifi, constrained: true)] {
+            let result = profile.decision(inputTokens: 2_000, localCapacity: 8_192, connection: path, now: now)
+            XCTAssertEqual(result.route, .onDevice)
+            XCTAssertEqual(result.reason, .insufficientEvidence)
+            XCTAssertNotNil(result.localEstimate)
+            XCTAssertNil(result.cloudEstimate)
+        }
         profile.changedConnection(wifi)
         XCTAssertEqual(profile.samples.filter { $0.model == .onDevice }.count, 3)
-        XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now), .cloud)
+        let result = profile.decision(inputTokens: 2_000, localCapacity: 8_192, connection: wifi, now: now)
+        XCTAssertEqual(result.route, .onDevice)
+        XCTAssertNil(result.cloudEstimate)
     }
 
     /// Offline and failed connections select local, with a bounded cloud retry cooldown.
@@ -107,12 +113,12 @@ final class AdaptiveRouterTests: XCTestCase {
     func testRetriesPCCAndRejectsStaleOrDissimilarHistory() {
         let profile = profile(local: 1, cloud: 4)
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi,
-            now: now.addingTimeInterval(601)), .cloud)
+            now: now.addingTimeInterval(601), configuration: .init(calibration: .singleProvider)), .cloud)
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi,
-            now: now.addingTimeInterval(8 * 86_400)), .cloud)
-        XCTAssertEqual(profile.choose(inputTokens: 500, localCapacity: 8_192, connection: wifi, now: now), .cloud)
+            now: now.addingTimeInterval(8 * 86_400), configuration: .init(calibration: .singleProvider)), .cloud)
+        XCTAssertEqual(profile.choose(inputTokens: 500, localCapacity: 8_192, connection: wifi, now: now, configuration: .init(calibration: .singleProvider)), .cloud)
         XCTAssertEqual(profile.choose(inputTokens: 2_000, localCapacity: 8_192, connection: wifi,
-            now: now.addingTimeInterval(-100)), .cloud)
+            now: now.addingTimeInterval(-100), configuration: .init(calibration: .singleProvider)), .cloud)
     }
 
     /// Recent observations outweigh old connection slowness and invalid timings are ignored.
@@ -143,7 +149,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testLocalPersistenceExcludesModelContentAndOSUpdatesResetIt() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, system: "test-os", monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, system: "test-os", monitorConnection: false)
         router.updateConnection(wifi)
         let value = try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: router.snapshot()) {
             "Private meeting words must not be stored in performance metadata."
@@ -151,9 +157,9 @@ final class AdaptiveRouterTests: XCTestCase {
         XCTAssertTrue(value.hasPrefix("Private"))
         let data = try Data(contentsOf: directory.appendingPathComponent("latency.json"))
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("Private meeting"))
-        XCTAssertEqual(AdaptiveRouter(directory: directory, system: "test-os", monitorConnection: false)
+        XCTAssertEqual(singleProviderRouter(directory: directory, system: "test-os", monitorConnection: false)
             .profile.samples.count, 1)
-        XCTAssertEqual(AdaptiveRouter(directory: directory, system: "new-os", monitorConnection: false)
+        XCTAssertEqual(singleProviderRouter(directory: directory, system: "new-os", monitorConnection: false)
             .profile.samples.count, 0)
         XCTAssertTrue(try hasBackupExclusion(at: directory))
     }
@@ -163,7 +169,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testMeasuresSelectedRequestAndLearnsCloudFailure() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         router.updateConnection(wifi)
         var calls = 0
         let _: Int? = try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: router.snapshot(),
@@ -188,7 +194,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testIgnoresInFlightResponseAfterConnectionChange() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         router.updateConnection(wifi)
         let old = router.snapshot()
         let value = try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: old) {
@@ -205,7 +211,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testCancellationDoesNotTrainTheRouter() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for explicit in [true, false] {
             let operation = Task {
                 try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: router.snapshot()) {
@@ -228,7 +234,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testSlowCloudCancellationBacksOffWithoutTrainingLatency() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false,
+        let router = singleProviderRouter(directory: directory, monitorConnection: false,
             configuration: .init(slowCloudAfter: .milliseconds(5)))
         do {
             let _: Int = try await router.measure(model: .cloud, inputTokens: 2_000, snapshot: router.snapshot()) {
@@ -250,7 +256,7 @@ final class AdaptiveRouterTests: XCTestCase {
     func testIgnoresReorderedPathCallbacks() {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         let older = ContinuousClock.now
         let newer = older.advanced(by: .seconds(1))
         router.updateConnection(cellular, observedAt: newer)
@@ -269,7 +275,7 @@ final class AdaptiveRouterTests: XCTestCase {
         let file = directory.appendingPathComponent("latency.json")
         let original = Data("unreadable existing cache".utf8)
         try original.write(to: file)
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         _ = try await router.measure(model: .onDevice, inputTokens: 2_000, snapshot: router.snapshot()) { 1 }
         XCTAssertEqual(try Data(contentsOf: file), original)
     }

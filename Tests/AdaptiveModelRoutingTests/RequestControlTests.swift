@@ -8,9 +8,17 @@ final class RequestControlTests: XCTestCase {
     /// Holds mutable non-Sendable app data to preserve the original generic response contract.
     private final class AppValue { var text = "value" }
 
+    /// Simulates a structured throttle returned after the request stops waiting.
+    private struct Throttle: RoutingRetryAfterProviding {
+        let routingRetryAfter: Date?
+    }
+
+    /// Keeps the main actor occupied past the cutoff so the request worker must detect expiry itself.
+    private func blockPastDeadline() { Thread.sleep(forTimeInterval: 0.25) }
+
     /// Creates deterministic routers without disk or live network observation.
     private func router(configuration: RoutingConfiguration = .balanced) -> AdaptiveRouter {
-        AdaptiveRouter(monitorConnection: false, configuration: configuration, persistence: .memoryOnly)
+        singleProviderRouter(monitorConnection: false, configuration: configuration, persistence: .memoryOnly)
     }
 
     /// Local-only policy overrides a contradictory preference and never retries cloud after local failure.
@@ -86,6 +94,71 @@ final class RequestControlTests: XCTestCase {
         await Task.yield()
         XCTAssertTrue(router.profile.samples.isEmpty)
         XCTAssertEqual(events.count, 1)
+    }
+
+    /// Provider failure after the cutoff is a timeout with no classification, health training or fallback.
+    func testErrorAfterCutoffPreservesOnlyTheServerThrottle() async throws {
+        let router = router()
+        var attempts: [RoutingAttempt] = []
+        do {
+            let _: RoutingResult<String> = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
+                deadline: .after(.milliseconds(150)),
+                shouldFallback: { _, _ in XCTFail("Expired failures cannot authorize recovery."); return true },
+                onAttempt: { attempts.append($0) }, cloud: {
+                    self.blockPastDeadline()
+                    throw Throttle(routingRetryAfter: .now.addingTimeInterval(3_600))
+                }, onDevice: { XCTFail("Deadline must prevent fallback."); return "local" })
+            XCTFail("Expected the request deadline.")
+        } catch RoutingRequestError.deadlineExceeded {}
+        XCTAssertEqual(attempts.map(\.outcome), [.timedOut])
+        XCTAssertTrue(router.profile.failures.isEmpty)
+        XCTAssertEqual(router.decision(inputTokens: 100, localCapacity: 8_192).reason, .cloudBackoff)
+    }
+
+    /// An error outside provider measurement still obeys the deadline when preflight occupies the main actor.
+    func testPreflightErrorAfterCutoffReportsDeadline() async throws {
+        let router = router()
+        do {
+            let _: String = try await router.withRequest(deadline: .after(.milliseconds(150)), onAttempt: { _ in
+                XCTFail("Preflight must not report provider attempts.")
+            }) { _ in
+                self.blockPastDeadline()
+                throw URLError(.badURL)
+            }
+            XCTFail("Expected the request deadline.")
+        } catch RoutingRequestError.deadlineExceeded {}
+    }
+
+    /// A late owned-stream throttle survives cancellation of its iterator without training the timed-out request.
+    func testOwnedStreamRetainsThrottleAfterDeadline() async throws {
+        let router = router()
+        let provider = ControlledRoutingProvider()
+        let finished = RoutingTestSignal()
+        var attempts: [RoutingAttempt] = []
+        let context = try RoutingRequestContext(deadline: .after(.milliseconds(150)), observer: { attempts.append($0) })
+        context.onWorkerFinished = { finished.signal() }
+        let events = AsyncThrowingStream<RoutingStreamEvent<String>, any Error>.makeStream()
+        defer { provider.release(); events.continuation.finish() }
+        do {
+            _ = try await RoutingRequestRunner.run(context: context) {
+                try await router.performStreaming(context: context, inputTokens: 100, localContextCapacity: 8_192,
+                    policy: .cloudRequired, workload: .init(), availability: .init(),
+                    shouldFallback: { _, _ in XCTFail("Expired errors cannot be classified."); return true },
+                    continuation: events.continuation, cloud: {
+                        RoutingProviderStream { _ in
+                            _ = await provider.call()
+                            throw Throttle(routingRetryAfter: .now.addingTimeInterval(3_600))
+                        }
+                    }, onDevice: { XCTFail("Cloud-only request cannot fall back."); return RoutingProviderStream { _ in } })
+            }
+            XCTFail("Expected the stream deadline.")
+        } catch RoutingRequestError.deadlineExceeded {}
+        provider.release()
+        await finished.wait()
+        XCTAssertEqual(attempts.map(\.outcome), [.timedOut])
+        XCTAssertTrue(router.profile.failures.isEmpty)
+        XCTAssertTrue(router.profile.samples.isEmpty)
+        XCTAssertEqual(router.decision(inputTokens: 100, localCapacity: 8_192).reason, .cloudBackoff)
     }
 
     /// One deadline covers both the failed cloud operation and local fallback rather than restarting per lane.

@@ -18,6 +18,55 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
         return profile
     }
 
+    /// A local advantage like the live test timings wins by default even below the former margins.
+    func testDefaultChoosesEvenASmallMeasuredAdvantage() {
+        for (local, cloud, expected) in [(0.46, 0.59, InferenceRoute.onDevice),
+                                         (1.0, 1.001, .onDevice), (1.001, 1.0, .cloud)] {
+            let profile = trained(local: local, cloud: cloud)
+            XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now), expected)
+            XCTAssertEqual(profile.decision(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now).route, expected)
+        }
+        XCTAssertEqual(trained(local: 0.46, cloud: 0.59).decision(inputTokens: 1_000, localCapacity: 8_192,
+            connection: wifi, now: now, configuration: .balanced).route, .cloud)
+    }
+
+    /// Fastest defaults have no hidden variability penalty, while an explicit conservative preset retains it.
+    func testDefaultDoesNotApplyACloudVariabilityPreference() {
+        var profile = PerformanceProfile()
+        for (index, seconds) in [2.0, 0.01, 0.01].enumerated() {
+            let date = now.addingTimeInterval(Double(index - 3))
+            profile.record(model: .onDevice, tokens: 1_000, seconds: seconds, connection: wifi, now: date)
+            profile.record(model: .cloud, tokens: 1_000, seconds: 0.5, connection: wifi, now: date)
+        }
+        XCTAssertEqual(profile.decision(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now).reason, .localFaster)
+        XCTAssertEqual(profile.decision(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now,
+            configuration: .balanced).reason, .cloudPreferred)
+    }
+
+    /// Exact latency ties retain the initial cloud selection rather than reporting a nonexistent local advantage.
+    func testDefaultKeepsCloudOnATieAndHonorsHardPolicies() {
+        let profile = trained(local: 0.5, cloud: 0.5)
+        XCTAssertEqual(profile.decision(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now).reason, .cloudPreferred)
+        XCTAssertEqual(trained(local: 0.46, cloud: 0.59).decision(inputTokens: 1_000, localCapacity: 8_192,
+            connection: wifi, now: now, policy: .cloudRequired).route, .cloud)
+    }
+
+    /// Raw configuration and integrated router defaults agree on the fastest policy, including customized instances.
+    @MainActor
+    func testFastestIsTheConfigurationAndRouterDefault() {
+        let router = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+        for config in [RoutingConfiguration(), .fastest, router.configuration,
+                       RoutingConfiguration(localResponseReserve: 512)] {
+            XCTAssertEqual(config.minimumLocalSavingSeconds, 0)
+            XCTAssertEqual(config.minimumLocalSavingFraction, 0)
+            XCTAssertEqual(config.variabilityAllowance, 0)
+            XCTAssertEqual(config.minimumSamples, 3)
+        }
+        XCTAssertEqual(RoutingConfiguration.balanced.minimumLocalSavingSeconds, 0.35)
+        XCTAssertEqual(RoutingConfiguration.balanced.minimumLocalSavingFraction, 0.25)
+        XCTAssertEqual(RoutingConfiguration.balanced.variabilityAllowance, 1)
+    }
+
     /// The presets change actual policy decisions while explicit quality requirements remain binding.
     func testPresetsHaveDistinctBehavior() {
         let profile = trained(local: 1, cloud: 1.2)
@@ -66,7 +115,7 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
     /// Large valid sample requirements complete cold-start calibration without cross-provider eviction.
     func testLargeSampleMinimumCanLearnFromColdStart() {
         let minimum = 65
-        let configuration = RoutingConfiguration(minimumSamples: minimum, predictionSampleLimit: minimum)
+        let configuration = RoutingConfiguration(minimumSamples: minimum, predictionSampleLimit: minimum, calibration: .singleProvider)
         var profile = PerformanceProfile()
         let requests = minimum * (minimum + 1)
         for index in 0..<requests {
@@ -95,7 +144,7 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
     func testDetailedFallbackResult() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         var events: [RoutingAttempt] = []
         let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
             onAttempt: { events.append($0) }, cloud: { nil }, onDevice: { "local" })
@@ -115,7 +164,7 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
     func testDetailedNoResultStatuses() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         let chunked: RoutingResult<String> = try await router.respondDetailed(inputTokens: 8_192,
             localContextCapacity: 8_192, cloud: { nil }, onDevice: { XCTFail("Input must be split."); return "invalid" })
         XCTAssertEqual(chunked.status, .requiresChunking)
@@ -133,7 +182,7 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
     func testCloudRemainsUsableWhenLocalUnavailable() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         let _: String? = try await router.respond(inputTokens: 10, localContextCapacity: 8_192,
             cloud: { nil }, onDevice: { "local" })
         let result = try await router.respondDetailed(inputTokens: 10, localContextCapacity: 8_192,
@@ -148,7 +197,7 @@ final class PresetsAndDiagnosticsTests: XCTestCase {
     func testAttemptEventsSurviveThrownErrors() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for cancelled in [false, true] {
             var events: [RoutingAttempt] = []
             do {

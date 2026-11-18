@@ -12,7 +12,8 @@ extension FoundationModelsRouter {
                 return try await self.router.performStreaming(context: context, inputTokens: request.tokens,
                     localContextCapacity: request.capacity, policy: policy,
                     workload: .init(expectedOutputTokens: request.options.maximumResponseTokens), availability: request.availability, calibrationIdentifier: request.identity,
-                    shouldFallback: self.shouldFallback, continuation: continuation,
+                    shouldFallback: { self.shouldFallback($0, $1) },
+                    cloudPermission: { self.allowsCloud(policy: policy, calibration: $0) }, continuation: continuation,
                     cloud: { self.backend.textStream(route: .cloud, prompt: prompt, instructions: self.instructions, options: request.options) },
                     onDevice: { self.backend.textStream(route: .onDevice, prompt: prompt, instructions: self.instructions, options: request.options) })
             }
@@ -29,7 +30,8 @@ extension FoundationModelsRouter {
                 return try await self.router.performStreaming(context: context, inputTokens: request.tokens,
                     localContextCapacity: request.capacity, policy: policy,
                     workload: .init(expectedOutputTokens: request.options.maximumResponseTokens), availability: request.availability, calibrationIdentifier: request.identity,
-                    shouldFallback: self.shouldFallback, continuation: continuation,
+                    shouldFallback: { self.shouldFallback($0, $1) },
+                    cloudPermission: { self.allowsCloud(policy: policy, calibration: $0) }, continuation: continuation,
                     cloud: { self.backend.structuredStream(route: .cloud, prompt: prompt, instructions: self.instructions,
                         options: request.options, generating: generating) },
                     onDevice: { self.backend.structuredStream(route: .onDevice, prompt: prompt, instructions: self.instructions,

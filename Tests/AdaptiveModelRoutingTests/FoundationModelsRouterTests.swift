@@ -25,6 +25,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         var cloudError: (any Error)?
         var tokenError: (any Error)?
         var localError: (any Error)?
+        var firstLocalProvider: ControlledRoutingProvider?
         var tokenProvider: ControlledRoutingProvider?
         var inspectedPolicies: [RoutingPolicy] = []
 
@@ -32,7 +33,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         func availability(for policy: RoutingPolicy) -> RoutingAvailability {
             inspectedPolicies.append(policy)
             return .init(onDevice: policy != .cloudRequired && availability.onDevice,
-                cloud: policy != .localOnly && availability.cloud)
+                cloud: policy != .localOnly && availability.cloud, cloudQuota: availability.cloudQuota)
         }
 
         /// Records full-prompt preflight inputs without contacting a tokenizer service.
@@ -53,6 +54,10 @@ final class FoundationModelsRouterTests: XCTestCase {
             limits.append(options.maximumResponseTokens)
             if route == .cloud, let cloudError { throw cloudError }
             if route == .onDevice, let localError { throw localError }
+            if route == .onDevice, let provider = firstLocalProvider {
+                firstLocalProvider = nil
+                return await provider.call()
+            }
             return route == .cloud ? "cloud" : "local"
         }
 
@@ -68,9 +73,138 @@ final class FoundationModelsRouterTests: XCTestCase {
     private func fixture(options: GenerationOptions = .init(maximumResponseTokens: 512),
         configuration: RoutingConfiguration = .balanced) -> (FoundationModelsRouter, Backend, URL) {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let core = AdaptiveRouter(directory: directory, monitorConnection: false, configuration: configuration)
+        let core = singleProviderRouter(directory: directory, monitorConnection: false, configuration: configuration)
         let backend = Backend()
         return (FoundationModelsRouter(router: core, instructions: "Summarize clearly", options: options, backend: backend), backend, directory)
+    }
+
+    /// A stopped stream consumer cannot release the secondary slot while its SDK producer is still running.
+    func testStreamingProbeTimeoutRetainsActualProducerSlot() async throws {
+        let backend = Backend()
+        let provider = ControlledRoutingProvider()
+        backend.firstLocalProvider = provider
+        let core = AdaptiveRouter(monitorConnection: false,
+            configuration: .init(calibration: .paired(refreshEvery: 1, timeout: .milliseconds(30))),
+            persistence: .memoryOnly)
+        let router = FoundationModelsRouter(router: core, instructions: "Summarize", options: .init(), backend: backend)
+        defer { provider.release(); router.cancelCalibration() }
+        for try await _ in router.stream(to: "request") {}
+        await provider.started.wait()
+        await router.waitForCalibration()
+        XCTAssertEqual(router.lastCalibrationAttempt?.outcome, .timedOut)
+        XCTAssertTrue(router.isCalibrating, "The provider, rather than only the stream consumer, owns the slot.")
+        for _ in 0..<2 {
+            for try await _ in router.stream(to: "request") {}
+        }
+        XCTAssertEqual(backend.routes.filter { $0 == .onDevice }.count, 1,
+            "Further requests must not start another secondary inference while the old producer is running.")
+        provider.release()
+        await provider.finished.wait()
+        await router.waitForCalibration()
+    }
+
+    /// Typed stream cancellation holds the producer slot just like plain text, without late schema training.
+    func testStructuredStreamingCancellationRetainsProducerSlot() async throws {
+        let backend = Backend()
+        let provider = ControlledRoutingProvider()
+        backend.firstLocalProvider = provider
+        let core = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+        let router = FoundationModelsRouter(router: core, instructions: "Summarize", options: .init(), backend: backend)
+        defer { provider.release(); router.cancelCalibration() }
+        for try await _ in router.stream(to: "request", generating: Summary.self) {}
+        await provider.started.wait()
+        router.cancelCalibration()
+        await router.waitForCalibration()
+        XCTAssertTrue(router.isCalibrating)
+        for _ in 0..<2 {
+            for try await _ in router.stream(to: "request", generating: Summary.self) {}
+        }
+        XCTAssertEqual(backend.routes.filter { $0 == .onDevice }.count, 1)
+        XCTAssertFalse(router.profile.samples.contains { $0.model == .onDevice })
+        provider.release()
+        await provider.finished.wait()
+    }
+
+    /// All four adapter APIs respect billing bounds across readiness, tokenization, quota and generation failures.
+    func testAppleAdapterDispatchBudgetMatrix() async throws {
+        let tokenErrors: [(any Error)?] = [nil, URLError(.timedOut), URLError(.badURL)]
+        let cloudErrors: [(any Error)?] = [nil,
+            PrivateCloudComputeLanguageModel.Error.quotaLimitReached(.init(debugDescription: "synthetic quota")),
+            URLError(.badURL)]
+        let localErrors: [(any Error)?] = [nil, URLError(.timedOut), URLError(.badURL)]
+        var cases = 0
+        var failures: [String] = []
+        for format in 0..<4 {
+            for policy in [RoutingPolicy.automatic, .localOnly, .cloudRequired] {
+                for localReady in [false, true] {
+                    for cloudReady in [false, true] {
+                        for oversized in [false, true] {
+                            for tokenError in tokenErrors.indices {
+                                for cloudError in cloudErrors.indices {
+                                    for localError in localErrors.indices {
+                                        cases += 1
+                                        let backend = Backend()
+                                        backend.availability = .init(onDevice: localReady, cloud: cloudReady)
+                                        backend.tokens = oversized ? 10_000 : 100
+                                        backend.tokenError = tokenErrors[tokenError]
+                                        backend.cloudError = cloudErrors[cloudError]
+                                        backend.localError = localErrors[localError]
+                                        let core = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+                                        let router = FoundationModelsRouter(router: core, instructions: "Synthetic", options: .init(), backend: backend)
+                                        do {
+                                            switch format {
+                                            case 0: _ = try await router.respond(to: "synthetic", policy: policy)
+                                            case 1: _ = try await router.respond(to: "synthetic", generating: Summary.self, policy: policy)
+                                            case 2: for try await _ in router.stream(to: "synthetic", policy: policy) {}
+                                            default: for try await _ in router.stream(to: "synthetic", generating: Summary.self, policy: policy) {}
+                                            }
+                                        } catch { /* Expected synthetic preflight/provider failures remain visible to the caller. */ }
+                                        await router.waitForCalibration()
+                                        let cloud = backend.routes.filter { $0 == .cloud }.count
+                                        let local = backend.routes.filter { $0 == .onDevice }.count
+                                        var violations: [String] = []
+                                        if cloud > 1 || local > 1 { violations.append("duplicate generation") }
+                                        if (!cloudReady || policy == .localOnly) && cloud > 0 { violations.append("forbidden cloud") }
+                                        if (!localReady || oversized || policy == .cloudRequired) && local > 0 { violations.append("forbidden local") }
+                                        let tokenRequired = localReady && policy != .cloudRequired
+                                        if backend.tokenCalls != (tokenRequired ? 1 : 0) { violations.append("tokenization policy") }
+                                        if tokenRequired && (tokenError == 2 || (tokenError == 1 && (!cloudReady || policy == .localOnly)))
+                                            && !backend.routes.isEmpty { violations.append("generation after terminal preflight failure") }
+                                        if !violations.isEmpty {
+                                            failures.append("case=\(cases),format=\(format),policy=\(policy),ready=\(localReady)/\(cloudReady),oversized=\(oversized),errors=\(tokenError)/\(cloudError)/\(localError): \(violations)")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(cases, 2_592)
+        XCTAssertTrue(failures.isEmpty, "\(failures.count) adapter cost failures: \(failures.prefix(12))")
+        print("Apple adapter dispatch budget matrix: \(cases) cases, \(failures.count) failures")
+    }
+
+    /// Default adapter calls pair text and structured generation without mixing their calibration identities.
+    func testPairedTextAndStructuredAdapterCalls() async throws {
+        let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = Backend()
+        let core = AdaptiveRouter(directory: directory, monitorConnection: false, persistence: .memoryOnly)
+        let router = FoundationModelsRouter(router: core, instructions: "Summarize", options: .init(), backend: backend)
+        XCTAssertEqual(core.configuration.calibration, .paired())
+        let text = try await router.respond(to: "text request")
+        await router.waitForCalibration()
+        XCTAssertEqual(text, "cloud")
+        XCTAssertEqual(backend.routes, [.cloud, .onDevice])
+        XCTAssertEqual(backend.prompts, ["text request", "text request"])
+        backend.routes = []
+        let typed = try await router.respond(to: "structured request", generating: Summary.self)
+        await router.waitForCalibration()
+        XCTAssertEqual(typed.text, "typed output")
+        XCTAssertEqual(backend.routes, [.cloud, .onDevice])
+        XCTAssertEqual(core.profile.samples.count, 2, "Schema changes start a new calibration identity.")
     }
 
     /// The simple string API handles provider execution, token accounting, instructions and response limits.
@@ -247,7 +381,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         XCTAssertEqual(result.value, "local")
         XCTAssertEqual(result.decision.reason, .localOnly)
         XCTAssertFalse(result.availability.cloud)
-        XCTAssertEqual(backend.inspectedPolicies, [.localOnly])
+        XCTAssertEqual(backend.inspectedPolicies, [.localOnly, .localOnly])
         backend.localError = URLError(.timedOut)
         do {
             _ = try await router.respond(to: "Private summary", policy: .localOnly)
@@ -337,7 +471,7 @@ final class FoundationModelsRouterTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         for _ in 0..<2 { _ = try await router.respond(to: "Summary") }
         let restored = FoundationModelsRouter(
-            router: AdaptiveRouter(directory: directory, monitorConnection: false),
+            router: singleProviderRouter(directory: directory, monitorConnection: false),
             instructions: "Summarize clearly", options: .init(maximumResponseTokens: 512), backend: backend)
         XCTAssertEqual(restored.profile.samples.count, 2)
         _ = try await restored.respond(to: "Another summary")

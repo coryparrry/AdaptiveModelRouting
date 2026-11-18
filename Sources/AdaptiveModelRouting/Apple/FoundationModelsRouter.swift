@@ -32,6 +32,14 @@ public final class FoundationModelsRouter {
     public var profile: PerformanceProfile { router.profile }
     /// Reports whether optional calibration is in memory, saved, unavailable or preserved for recovery.
     public var storageStatus: RoutingStorageStatus { router.storageStatus }
+    /// Reports whether a secondary model is currently measuring a selected real request.
+    public var isCalibrating: Bool { router.isCalibrating }
+    /// Exposes the most recent secondary timing without retaining its answer.
+    public var lastCalibrationAttempt: RoutingAttempt? { router.lastCalibrationAttempt }
+    /// Waits for current paired calibration without starting another generation.
+    public func waitForCalibration() async { await router.waitForCalibration() }
+    /// Stops background inference when the consuming app suspends or leaves the workload.
+    public func cancelCalibration() { router.cancelCalibration() }
 
     /// Clears this workload's timings and its owned metadata file when disk storage is enabled.
     public func resetProfile() throws { try router.resetProfile() }
@@ -45,7 +53,7 @@ public final class FoundationModelsRouter {
     /// Names are encoded as a single cache component so slashes and dot segments cannot escape the root.
     public convenience init(
         workload: String = "default", instructions: String? = nil,
-        configuration: RoutingConfiguration = .balanced,
+        configuration: RoutingConfiguration = .fastest,
         options: GenerationOptions = .init(maximumResponseTokens: 512),
         cacheRoot: URL = AdaptiveRouter.defaultCacheDirectory.appendingPathComponent("AppleWorkloads", isDirectory: true),
         localModel: SystemLanguageModel? = nil,
@@ -131,9 +139,22 @@ public final class FoundationModelsRouter {
             return try await self.router.performDetailed(context: context, inputTokens: prepared.tokens,
                 localContextCapacity: prepared.capacity, policy: policy,
                 workload: .init(expectedOutputTokens: prepared.options.maximumResponseTokens), availability: prepared.availability, calibrationIdentifier: prepared.identity,
-                shouldFallback: self.shouldFallback,
-                cloud: { try await generate(.cloud, prepared.options) }, onDevice: { try await generate(.onDevice, prepared.options) })
+                shouldFallback: { self.shouldFallback($0, $1) },
+                cloudPermission: { self.allowsCloud(policy: policy, calibration: $0) },
+                cloud: { _, _ in try await generate(.cloud, prepared.options) },
+                onDevice: { _, _ in try await generate(.onDevice, prepared.options) })
         }
+    }
+
+    /// Rechecks current provider/quota eligibility without treating quota protection as a latency score.
+    func availability(for policy: RoutingPolicy) -> RoutingAvailability {
+        backend.availability(for: policy).restricted(to: policy, conserveQuota: router.configuration.conserveCloudQuota)
+    }
+
+    /// Checks quota again at the last adapter boundary before an inference operation is created.
+    func allowsCloud(policy: RoutingPolicy, calibration: Bool) -> Bool {
+        let current = availability(for: policy)
+        return current.cloud && (!calibration || current.permitsCloudCalibration)
     }
 
     /// Accounts for local context only when permitted; tokenization failures cannot outlive the request.
@@ -152,18 +173,22 @@ public final class FoundationModelsRouter {
         let identity = RoutingFingerprint.make([
             modelIdentifier, instructions ?? "", String(reflecting: options), schemaKey, appVersion,
         ])
-        var availability = backend.availability(for: policy)
+        var availability = self.availability(for: policy)
         var tokens = 0
         if availability.onDevice {
             do { tokens = try await backend.inputTokens(prompt: prompt, instructions: instructions, schema: schema) }
             catch is CancellationError { throw CancellationError() }
             catch {
                 try context.checkActive()
-                let retry = availability.cloud && shouldFallback(.onDevice, error)
+                let current = self.availability(for: policy)
+                let retry = current.cloud && shouldFallback(.onDevice, error)
                 try context.checkActive()
                 guard retry else { throw error }
-                availability = .init(onDevice: false, cloud: availability.cloud)
+                availability = .init(onDevice: false, cloud: current.cloud, cloudQuota: current.cloudQuota)
             }
+            let current = self.availability(for: policy)
+            availability = .init(onDevice: availability.onDevice && current.onDevice,
+                cloud: current.cloud, cloudQuota: current.cloudQuota)
         }
         try context.checkActive()
         return (tokens, availability.onDevice ? backend.localContextCapacity : 0, availability, options, identity)

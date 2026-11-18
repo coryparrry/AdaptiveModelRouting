@@ -15,7 +15,7 @@ import AdaptiveModelRouting
 let router = FoundationModelsRouter(
     workload: "summaries",
     instructions: "Summarize accurately and concisely.",
-    configuration: .qualityFirst
+    configuration: .fastest
 )
 
 let output = try await router.respond(to: transcript, policy: .localOnly)

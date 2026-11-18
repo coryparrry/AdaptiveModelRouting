@@ -19,3 +19,5 @@ Add regression tests for changed behavior and maintain at least 85% documentatio
 Preserve the one-product, one-import public API. Hard provider constraints must apply during preflight, fallback, streaming and failure. Never retry after publishing partial output. Deadlines and cancellation must not permit late profile training or callbacks, and reset must preserve unrelated files.
 
 Tests and CI use injected providers. Do not add native generation, PCC requests, signing changes, a release tag or distribution steps to the offline validation pipeline. Those are separate qualification/release decisions.
+
+Cost-sensitive verification is specified in [docs/COST_SAFETY.md](docs/COST_SAFETY.md). The normal Swift suites include dispatch matrices and lifecycle budgets. Collect compiler coverage with `swift test --enable-code-coverage`, and run `python3 scripts/test_cost_mutations.py` for isolated fault injection. The mutation runner copies current source/test inputs, checks a clean baseline, restores each mutation, and verifies a restored baseline; it never edits the working source and makes no live provider calls. It preserves logs and checkpoints under `.build`.

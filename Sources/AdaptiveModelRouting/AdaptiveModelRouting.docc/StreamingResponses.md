@@ -46,3 +46,34 @@ extension Summary.PartiallyGenerated: Sendable {}
 The compiler verifies that its generated fields are safe to transfer. The compiled `AppleGenerator` example demonstrates this declaration.
 
 When you need a concrete fully generated type instead of partial fields, use `respond(to:generating:)`.
+
+## Custom provider ownership
+
+Apple text and typed streams track their producer task through actual SDK-worker exit. A cancelled consumer or expired deadline can return promptly while the producer still runs; that producer continues occupying the secondary slot until it exits. Its late output cannot publish or train the profile.
+
+For custom providers, use ``AdaptiveRouter/streamOwned(inputTokens:localContextCapacity:policy:workload:availability:deadline:shouldFallback:onAttempt:cloud:onDevice:)`` and return ``RoutingProviderStream`` values. Await all SDK/transport work inside the producer closure. This lets the router retain execution ownership through cancellation and prevents an unfinished producer from being replaced by another secondary call.
+
+```swift
+let response = router.streamOwned(
+    inputTokens: requestTokens,
+    localContextCapacity: localCapacity,
+    cloud: {
+        RoutingProviderStream { continuation in
+            for try await snapshot in cloudSDKStream() {
+                try Task.checkCancellation()
+                continuation.yield(snapshot)
+            }
+        }
+    },
+    onDevice: {
+        RoutingProviderStream { continuation in
+            for try await snapshot in localSDKStream() {
+                try Task.checkCancellation()
+                continuation.yield(snapshot)
+            }
+        }
+    }
+)
+```
+
+The original closure-based `stream` accepts bare `AsyncThrowingStream` values for compatibility. Their external producer lifetime is controlled by the app; the router cannot join a task it was never given. Those providers must implement cancellation correctly. Returning early while a detached producer continues running falls outside the producer-ownership guarantee. Provider-internal retries and remote work that continues after SDK cancellation also remain controlled by the provider.

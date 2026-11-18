@@ -2,19 +2,25 @@
 
 A Swift package that learns when to use an on-device model or a preferred cloud model such as Private Cloud Compute.
 
-It starts cloud-first, learns from real request timings on the current device and connection, and chooses local inference when it has a meaningful speed advantage. One product and one import provide the Apple adapter, routing presets and detailed results. Apps can also supply their own inference closures.
+It starts cloud-first, measures both models on a few real requests, and chooses the model with the lowest predicted latency once calibrated. It continues sampling the alternative model as the app is used. One product and one import provide the Apple adapter, routing presets and detailed results. Apps can also supply their own inference closures.
 
 Build with an **iOS/macOS 27 SDK**; validation currently uses Xcode 27.3. Core routing APIs support **iOS 26+** and **macOS 26+**. The Apple adapter requires an **iOS/macOS 27 runtime**. The package uses Apple's Foundation, Network, Foundation Models and CryptoKit frameworks, with no third-party dependencies.
 
 ## Add the package
 
-This is a private repository. Consumers need read access through their authenticated Git or Xcode account. The APIs documented here require the development branch until the next tagged release; **0.1.0 predates the request policies and Apple adapter**:
+This is a private repository. Consumers need read access through their authenticated Git or Xcode account. Version 0.1.0 predates the Apple adapter. To test the features documented in this candidate before it is tagged, point your app at the local checkout.
 
 ```swift
-.package(url: "https://github.com/coryparrry/AdaptiveModelRouting.git", branch: "main")
+.package(path: "../AdaptiveModelRouting")
 ```
 
 Add `.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")` to your target. Everything is available through `import AdaptiveModelRouting`. Use a tagged version or commit revision for reproducible production builds once the desired changes are available.
+
+### Upgrading from 0.1.0
+
+Automatic routing now uses paired calibration by default. Both provider closures can receive the same prompt, and secondary work may continue after the foreground answer returns. Choose `RoutingConfiguration(calibration: .singleProvider)` to disable parallel calibration. Use `.localOnly` for requests that must stay on the device. A permitted fallback can still call the other provider in single-provider mode.
+
+The default selector now prefers the lowest measured latency. The default 60-second deadline covers preflight, generation and fallback together. Provider closures passed through a wrapper must be escaping and main-actor isolated. The default disk cache now uses a per-app directory, so apps using the old default start with fresh timings. Apps supplying their own directory can reuse compatible caches.
 
 ## Use Apple Foundation Models
 
@@ -27,7 +33,7 @@ import AdaptiveModelRouting
 let router = FoundationModelsRouter(
     workload: "summaries",
     instructions: "Summarize accurately and concisely.",
-    configuration: .qualityFirst
+    configuration: .fastest
 )
 
 let summary = try await router.respond(to: transcript)
@@ -45,9 +51,12 @@ The adapter supports text, structured output and streaming with fresh sessions, 
 
 Workload names select fixed-length, hashed cache-directory names within an app-specific namespace. The adapter automatically resets calibration when instructions, schema, generation options, app build or model identity change. Supply a stable `modelIdentifier` for custom model objects to retain their calibration between launches; opaque custom models otherwise receive a fresh identity. Keep one owner per workload/cache root. Customize `cacheRoot`, `localModel`, `cloudModel` and `shouldFallback` at initialization when needed.
 
+Automatic requests use paired calibration by default: the selected provider supplies the answer while a bounded background call measures the alternative on the same prompt. Initially, cloud supplies the answer until both providers have enough comparable observations. Secondary text and streaming snapshots stay hidden. A recoverable foreground failure can reuse the secondary call for fallback, without invoking that provider twice.
+
 ## Presets and overrides
 
-- `.balanced` preserves the original cloud-first defaults, three samples per lane and a one-deviation timing allowance.
+- `.fastest` is the default: three samples per lane, zero minimum saving and zero variability penalty. It selects the lower weighted latency; exact ties retain cloud.
+- `.balanced` explicitly opts into a 350 ms/25% local-saving requirement and a one-deviation timing allowance.
 - `.qualityFirst` requires five samples per lane, at least 750 ms/40% local savings, and a 1.5-deviation allowance.
 - `.latencyFirst` requires three samples, at least 100 ms/10% local savings, and a 0.5-deviation allowance.
 
@@ -58,9 +67,14 @@ let configuration = RoutingConfiguration(
     customizing: .qualityFirst,
     localResponseReserve: 768,
     failureBackoff: 120,
-    cloudRetryInterval: 300
+    cloudRetryInterval: 300,
+    calibration: .paired(refreshEvery: 1, timeout: .seconds(30))
 )
 ```
+
+After initial learning, `refreshEvery` schedules an alternative-model probe every N eligible requests. Missing, expired or stale comparable evidence triggers earlier probing. Each router permits at most one owned secondary call at a time. The probe timeout is also capped by the originating request's remaining deadline. Foreground success does not wait for the probe; cancellation, failure, reset and connection/model changes invalidate owned probes. `isCalibrating`, `lastCalibrationAttempt`, `waitForCalibration()` and `cancelCalibration()` expose background lifecycle separately from foreground attempt diagnostics. Stop calibration when the app suspends or leaves the workload if continued background work is inappropriate. Providers that ignore cancellation may continue their underlying work, but their abandoned output cannot train the router.
+
+Paired calls consume additional local compute and cloud quota; measurements reflect concurrent inference conditions. Provider closures must be safe to execute for calibration without committing tool calls, purchases or other side effects. Choose `calibration: .singleProvider` to retain the original one-provider exploration policy. Hard `.localOnly` and `.cloudRequired` requests never start an alternative-provider probe. Timing calibration does not evaluate output quality: use automatic routing only where either model is suitable, and require cloud explicitly for tasks that depend on its capabilities.
 
 Configuration also exposes sample count, prediction sample limit, size tolerance, sample lifetime, local refresh interval, variability allowance and slow-cloud threshold. Invalid configuration is rejected at initialization.
 
@@ -108,7 +122,33 @@ The counts and generation functions above belong to your app. Count the full inp
 
 Return `nil` from the cloud closure when the provider is unavailable, out of quota or cannot fit the request, and local recovery is appropriate. Throw provider errors normally. Cancellation is propagated without starting another inference. A `nil` overall result means no permitted whole-request result is available; the caller can chunk the input or apply its own recovery behavior. For oversized local requests, the package never attempts an overflowing whole-local call.
 
-When using Apple Foundation Models, your app owns model availability/quota checks, tokenization, cloud capacity checks and session generation options. PCC still requires the appropriate entitlement and signing profile in the consuming app. The package does not provision access or supply an API key.
+The Apple adapter checks native model availability and PCC quota status, tokenizes local requests and applies session generation options. Custom providers supply their own availability/quota state and capacity checks. PCC still requires the appropriate entitlement and signing profile in the consuming app. The package does not provision access or supply an API key.
+
+## Provider call budgets
+
+Each request dispatches a given provider at most once, counting foreground generation, secondary calibration and fallback together. A fallback reuses its already-running secondary call. Neither route previews nor profile inspection start inference.
+
+| Request | Cloud operations | Local operations |
+|---|---:|---:|
+| `.localOnly` | 0 | At most 1 |
+| `.cloudRequired` | At most 1 | 0 |
+| Automatic, initial paired learning | At most 1 | At most 1 |
+| Automatic, calibrated and no probe due | Selected provider, plus at most one permitted recovery on the other provider | Same bound |
+| Automatic, probe due | At most 1 | At most 1 |
+
+Cold paired learning normally calls both providers on three comparable requests (five with quality-first). After learning, each eligible cloud-selected request can recheck local inference by default, trading extra device compute for faster quota-saving adaptation. A local-winning workload can make a cloud calibration call only after a minimum 600 seconds since its last cloud use (`cloudRetryInterval`). Failed, timed-out and standalone measured cloud calls also start that cooldown; missing evidence cannot bypass it. The timestamp is persisted before dispatch and survives normal disk-backed restarts and calibration identity changes. These probes consume provider quota even though their output is hidden. Stable workload names, retaining the router, and disk persistence avoid unnecessary repeated cold starts. Schema, instructions, model/build or OS changes can legitimately invalidate timing calibration while retaining the cloud-use cooldown. Memory-only histories restart with their owner.
+
+Default fastest paired routing confirms mixed evidence before a paid promotion: when either of the latest two completed comparable pairs found local faster, the latest `minimumSamples` local observations must all be slower than the latest cloud timing. This avoids promoting on an isolated local spike; a decisive cloud probe can still promote immediately. Completed pairs retain numeric comparison metadata through cache reloads and local-history pruning. `conserveCloudQuota: false` opts out of this confirmation. Predictions cannot guarantee the fastest future response, and a genuine slowdown may require additional local observations before switching.
+
+By default, `conserveCloudQuota: true` excludes PCC from automatic requests when Apple's SDK reports an approaching limit. Exhausted quota excludes PCC under every policy. Explicit `.cloudRequired` requests can use approaching-limit quota; setting `conserveCloudQuota: false` also opts automatic foreground requests into that use. Optional cloud calibration never runs near the limit. The adapter rechecks quota after asynchronous tokenization and immediately before cloud dispatch. A declined dispatch does not count as a provider failure.
+
+The SDK exposes quota pressure, not an exact remaining request/token balance. These controls cannot reserve quota shared with other apps or impose an app-wide budget across independent routers. Custom providers report pressure through `RoutingAvailability(cloudQuota:)`; `.unknown` means no quota information was supplied.
+
+`calibration: .singleProvider` disables secondary calibration calls, while retaining one-provider exploration and permitted fallback. Use `.localOnly` to prohibit cloud calls: `.automatic` can still try cloud after a recoverable local failure even if the last observed connection was offline. A connection observation is not a spending policy.
+
+One secondary operation is owned per router. Apple streams and custom `streamOwned`/`RoutingProviderStream` sources retain that slot until actual producer exit, including ignored cancellation. Bare `AsyncThrowingStream` sources supplied to the legacy core `stream` API remain responsible for their own external producer cancellation. See the [stream ownership guide](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/StreamingResponses.md).
+
+These bounds apply to router-dispatched operations. Provider SDK retries, remote work continuing after transport cancellation, token prices, and the app's foreground request rate need app/provider budget controls. Foreground `attempts` exclude secondary work; account for calibration through provider instrumentation and `lastCalibrationAttempt`. There is no built-in currency/token spending cap. The [cost-safety verification contract](docs/COST_SAFETY.md) records the tested boundaries and qualification limits.
 
 ## Quality requirements and errors
 
@@ -159,23 +199,30 @@ Updates are cumulative snapshots, so replace the displayed response instead of a
 
 ## Learning and recovery
 
-- Initially prefers cloud inference, with a product preference for its reasoning quality rather than a claim that it is always more accurate.
-- Selects one local request after three comparable cloud requests until it has three local observations. Calibration does not shadow-run both models; provider failures can still invoke normal fallback.
-- With the balanced preset, compares at least three recent observations per lane within 25% of input size and expected output size, weighting recent measurements more heavily. Unspecified output sizes match only other unspecified sizes. Presets and overrides can change these limits.
+- With both providers uncalibrated, initially answers from cloud while collecting comparable timings for both providers. Once calibrated, the default selects the lowest predicted latency without assuming cloud output is better.
+- Initially runs both providers on eligible automatic requests until each has enough comparable observations: three per lane for fastest/balanced/latency-first and five for quality-first. In the usual sequential case this takes three or five completed paired requests. Cloud answers are returned while local lacks enough evidence; a qualified local lane can serve while cloud is being revalidated. Secondary output is discarded unless needed for permitted fallback.
+- With native network monitoring, optional paid startup calibration waits for one successful admitted local observation and initial accepted connection state. A newer explicit known connection also satisfies readiness. The foreground answer, required cloud work and failure recovery remain available. Deferred requests consume neither PCC cooldown nor probe cadence, and no startup timer is added. Calibration continues on a subsequent eligible request.
+- With zero saving margins and zero variability allowance (the default fastest configuration), a newly faster local observation can start foreground local learning before stale weighted timings would switch. Each permission is consumed and persisted before execution; failures and cancellation cannot replay it. These calls answer the request locally and leave PCC's cooldown untouched. Cloud-favoring presets keep their existing policy.
+- After a network reset, qualified local timings keep serving while cloud evidence is missing. Optional PCC probes remain at least 10 minutes apart by default. If a completed current, comparable cloud observation beats both the qualified local prediction and its latest comparable observation, it permits one foreground cloud learning attempt. Each successful admitted cloud result can permit the next until three observations qualify the comparison. Failed, cancelled, unavailable or timed-out attempts cannot reuse the consumed observation, including after ordinary relaunch. These learning calls answer real requests rather than adding hidden PCC calls. Hard policies and failure recovery retain precedence.
+- By default, compares at least three recent observations per lane within 25% of input size and expected output size, weighting recent measurements more heavily. Unspecified output sizes match only other unspecified sizes. Presets and overrides can change these limits.
 - Separates fresh and reused sessions for each provider using `RoutingWorkload(localSession:cloudSession:)`. Keep separate routers for tasks with materially different prompts or generation settings; metadata is supplied by the caller, not inferred from model contents.
-- Accounts for weighted timing spread: local must remain faster after subtracting the configured variability allowance from cloud latency and adding it to local latency (one standard deviation per provider by default). This is a conservative heuristic, not a statistical confidence guarantee or a quality evaluation.
-- By default, local must save at least **350 ms** and **25%** of predicted cloud latency. Both margins and the local response reserve are configurable.
+- Reports weighted timing spread. Optional presets can subtract a variability allowance from cloud latency and add it to local latency; the default fastest policy applies no variability penalty. These allowances are heuristics, not quality evaluations or statistical confidence guarantees.
+- By default, any lower predicted latency can win after sufficient calibration. Explicit `.balanced` and `.qualityFirst` presets retain configurable cloud-favoring margins. Hard request policies, availability, local context capacity and failure backoff still take precedence.
 - Separates cloud history by Wi-Fi, cellular, wired/other, and expensive/constrained path flags. Local timings remain device-specific across connections.
-- Backs off for 60 seconds after failure, and periodically retries cloud after ten minutes rather than freezing on an old slow connection. Local calibration can refresh after 30 minutes.
+- Backs off for 60 seconds after a recoverable failure. By default it considers the alternative on every eligible request, subject to provider eligibility and quota pacing. Explicit paired refresh counts remain configurable. Cloud calibration also requires 600 seconds since the latest cloud use, including failed attempts; local refresh uses a 30-minute evidence age. Probes run only when app requests arrive. In single-provider mode these refreshes use a foreground request instead.
 - Marks cloud requests still pending after the configured slow limit (20 seconds by default) for health backoff. This watch is separate from the overall request deadline.
 
 Use `PerformanceProfile` directly for deterministic policy decisions, `InferenceExecutor` for fallback execution alone, or `AdaptiveRouter` for integrated observation, persistence and execution. `monitorConnection: false` and `updateConnection` support deterministic testing or caller-owned network observation.
 
 ## Local data
 
-History retains at most 128 timings per provider (256 total), so frequent requests to one provider cannot evict the other provider's calibration. Prediction sample limits and minimums cannot exceed 128.
+Prediction weights decay by both observation rank and elapsed time (`predictionHalfLife`, default 300 seconds), so an old fast result does not dominate fresh measurements. The small-window selector keeps stable timestamp ordering without sorting the whole history. History retains at most 128 timings per provider (256 total), so frequent requests to one provider cannot evict the other provider's calibration. Prediction sample limits and minimums cannot exceed 128.
 
-The bounded, backup-excluded cache contains only route, input token count, expected output token count, session-reuse flags, elapsed time, timestamp, coarse path flags, OS version and an optional opaque calibration-identity digest. It stores no prompts, outputs, meeting questions, SSIDs, IP addresses or account identifiers. Older caches without workload metadata remain readable as fresh sessions with unspecified output size. iPhone cache files use protection until first authentication. OS updates reset calibration, and unreadable caches are preserved instead of overwritten. There is no built-in telemetry or calibration server.
+The bounded, backup-excluded cache contains cloud-use and local-learning timestamps and route, input token count, expected output token count, session-reuse flags, elapsed time, timestamp, coarse path flags, OS version and an optional opaque calibration-identity digest. It stores no prompts, outputs, meeting questions, SSIDs, IP addresses or account identifiers. Older caches without workload metadata remain readable as fresh sessions with unspecified output size. iPhone cache files use protection until first authentication. OS updates reset calibration, and unreadable caches are preserved instead of overwritten. There is no built-in telemetry or calibration server.
+
+Additional offline lifecycle coverage and its limits are recorded in [Simulated production coverage](docs/SIMULATED_PRODUCTION_COVERAGE.md).
+
+Apple quota and rate-limit errors with an explicit reset date block router-managed cloud requests until that date, even when the normal retry interval expires sooner. The longest known deadline survives connection changes, calibration identity changes and disk-backed restarts. An active deadline also survives `resetProfile()` through minimal retry metadata; explicit cloud-required requests and local-failure recovery cannot bypass it. Errors without a reset date retain the normal failure backoff and paid-probe pacing. Independent router owners do not coordinate their quota state.
 
 Initialize either router with `persistence: .memoryOnly` to avoid reading or writing calibration files. `setPersistence(.memoryOnly)` removes its existing cache by default; `resetProfile()` clears learned timings and health backoff. In-flight requests cannot repopulate a reset profile. Inspect `storageStatus` to distinguish memory-only operation, successful persistence and storage errors without failing inference. The core's `updateCalibrationIdentifier(_:)` supports caller-owned model or workload versioning.
 

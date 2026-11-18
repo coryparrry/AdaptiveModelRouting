@@ -27,6 +27,7 @@ public enum DemoPolicy: String, CaseIterable, Identifiable, Sendable {
 
 /// Lets the sample select presets without duplicating their tuning values.
 public enum DemoPreset: String, CaseIterable, Identifiable, Sendable {
+    case fastest = "Fastest"
     case balanced = "Balanced"
     case quality = "Quality first"
     case latency = "Latency first"
@@ -34,6 +35,7 @@ public enum DemoPreset: String, CaseIterable, Identifiable, Sendable {
     /// Uses the package's validated default configuration for each choice.
     var value: RoutingConfiguration {
         switch self {
+        case .fastest: .fastest
         case .balanced: .balanced
         case .quality: .qualityFirst
         case .latency: .latencyFirst
@@ -58,6 +60,11 @@ public struct DemoAttempt: Identifiable, Sendable {
     public let duration: String
 }
 
+/// Persists only the explicit storage preference, independently of prompt or response content.
+private struct DemoStoragePreference: Codable {
+    let enabled: Bool
+}
+
 /// Owns the sample's routing flow and guards observable state against late cancelled-task completion.
 @MainActor
 @Observable
@@ -65,7 +72,7 @@ public final class DemoModel {
     public var prompt = "Summarize the trade-offs between local and cloud models."
     public var mode: DemoMode = .simulated
     public var policy: DemoPolicy = .local
-    public var preset: DemoPreset = .balanced
+    public var preset: DemoPreset = .fastest
     public var fault: DemoFault = .none
     public var deadlineSeconds = 5.0
     public private(set) var persistCalibration = false
@@ -84,9 +91,13 @@ public final class DemoModel {
     @ObservationIgnored private var core: AdaptiveRouter
     @ObservationIgnored private var apple: FoundationModelsRouter?
 
-    /// Starts with memory-only fixture routing and no Apple model instances or network observation.
+    /// Starts with fixture routing and restores only the user's explicit calibration-storage preference.
     public init(cacheRoot: URL = URL.applicationSupportDirectory.appendingPathComponent("AdaptiveModelRoutingDemo")) {
         self.cacheRoot = cacheRoot
+        if let data = try? Data(contentsOf: cacheRoot.appendingPathComponent("storage-preference.json")),
+            let preference = try? JSONDecoder().decode(DemoStoragePreference.self, from: data) {
+            persistCalibration = preference.enabled
+        }
         core = AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false, persistence: .memoryOnly)
     }
 
@@ -182,6 +193,9 @@ public final class DemoModel {
         do {
             try activeRouter.setPersistence(enabled ? .disk : .memoryOnly)
             persistCalibration = enabled
+            try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+            let preference = try JSONEncoder().encode(DemoStoragePreference(enabled: enabled))
+            try preference.write(to: cacheRoot.appendingPathComponent("storage-preference.json"), options: .atomic)
             errorMessage = nil
         } catch { errorMessage = error.localizedDescription }
         refreshProfile()
@@ -259,6 +273,7 @@ public final class DemoModel {
         case .cloudRefresh: "Checking cloud speed again"
         case .localUnavailable: "Local model not ready"
         case .cloudUnavailable: "Cloud model not ready"
+        case .cloudQuotaConserved: "Preserving cloud quota"
         case .localContextExceeded: "Input exceeds local context"
         case .noAvailableProvider: "No model is ready"
         }

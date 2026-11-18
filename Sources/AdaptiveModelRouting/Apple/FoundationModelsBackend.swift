@@ -18,10 +18,10 @@ protocol FoundationModelsBackend {
         options: GenerationOptions, generating: Content.Type) async throws -> Content
     /// Produces cumulative text snapshots and honors consumer cancellation.
     func textStream(route: InferenceRoute, prompt: String, instructions: String?, options: GenerationOptions)
-        -> AsyncThrowingStream<String, any Error>
+        -> RoutingProviderStream<String>
     /// Produces native partially-generated values for Sendable generated models.
     func structuredStream<Content: Generable>(route: InferenceRoute, prompt: String, instructions: String?,
-        options: GenerationOptions, generating: Content.Type) -> AsyncThrowingStream<Content.PartiallyGenerated, any Error>
+        options: GenerationOptions, generating: Content.Type) -> RoutingProviderStream<Content.PartiallyGenerated>
         where Content.PartiallyGenerated: Sendable
 }
 
@@ -45,10 +45,16 @@ final class AppleFoundationModelsBackend: FoundationModelsBackend {
         if policy == .localOnly { return .init(onDevice: local.isAvailable, cloud: false) }
         let cloud = cloudModel()
         let cloudAvailable: Bool
-        if !cloud.isAvailable { cloudAvailable = false }
-        else if case .limitReached = cloud.quotaUsage.status { cloudAvailable = false }
-        else { cloudAvailable = true }
-        return .init(onDevice: policy != .cloudRequired && local.isAvailable, cloud: cloudAvailable)
+        let quota: CloudQuotaStatus
+        if !cloud.isAvailable { cloudAvailable = false; quota = .unknown }
+        else {
+            switch cloud.quotaUsage.status {
+            case .belowLimit(let usage): cloudAvailable = true; quota = usage.isApproachingLimit ? .approachingLimit : .available
+            case .limitReached: cloudAvailable = false; quota = .exhausted
+            @unknown default: cloudAvailable = false; quota = .unknown
+            }
+        }
+        return .init(onDevice: policy != .cloudRequired && local.isAvailable, cloud: cloudAvailable, cloudQuota: quota)
     }
 
     var localContextCapacity: Int { local.contextSize }
@@ -64,14 +70,24 @@ final class AppleFoundationModelsBackend: FoundationModelsBackend {
     /// Creates an isolated session for plain-text output.
     func text(route: InferenceRoute, prompt: String, instructions: String?, options: GenerationOptions) async throws -> String {
         let session = session(route: route, instructions: instructions)
-        return try await session.respond(to: prompt, options: options).content
+        let trace = NativeInferenceTrace(route: route, format: "text")
+        do {
+            let content = try await session.respond(to: prompt, options: options).content
+            trace.finish(succeeded: true)
+            return content
+        } catch { trace.finish(succeeded: false); throw error }
     }
 
     /// Includes the generated type's schema in the provider's prompt and returns its decoded content.
     func structured<Content: Generable>(route: InferenceRoute, prompt: String, instructions: String?,
         options: GenerationOptions, generating: Content.Type) async throws -> Content {
         let session = session(route: route, instructions: instructions)
-        return try await session.respond(to: prompt, generating: generating, options: options).content
+        let trace = NativeInferenceTrace(route: route, format: "structured")
+        do {
+            let content = try await session.respond(to: prompt, generating: generating, options: options).content
+            trace.finish(succeeded: true)
+            return content
+        } catch { trace.finish(succeeded: false); throw error }
     }
 
     /// Keeps provider histories independent and avoids replaying side effects between providers.
@@ -92,38 +108,37 @@ final class AppleFoundationModelsBackend: FoundationModelsBackend {
 
     /// Uses the SDK's native text stream without retaining completed prompts in the router.
     func textStream(route: InferenceRoute, prompt: String, instructions: String?, options: GenerationOptions)
-        -> AsyncThrowingStream<String, any Error> {
+        -> RoutingProviderStream<String> {
         let session = session(route: route, instructions: instructions)
-        return bridge(session: session, stream: session.streamResponse(to: prompt, options: options))
+        let trace = NativeInferenceTrace(route: route, format: "textStream")
+        return bridge(session: session, stream: session.streamResponse(to: prompt, options: options), trace: trace)
     }
 
     /// Exposes native partial content while keeping the concrete schema in preflight and generation.
     func structuredStream<Content: Generable>(route: InferenceRoute, prompt: String, instructions: String?,
-        options: GenerationOptions, generating: Content.Type) -> AsyncThrowingStream<Content.PartiallyGenerated, any Error>
+        options: GenerationOptions, generating: Content.Type) -> RoutingProviderStream<Content.PartiallyGenerated>
         where Content.PartiallyGenerated: Sendable {
         let session = session(route: route, instructions: instructions)
-        return bridge(session: session, stream: session.streamResponse(to: prompt, generating: generating, options: options))
+        let trace = NativeInferenceTrace(route: route, format: "structuredStream")
+        return bridge(session: session, stream: session.streamResponse(to: prompt, generating: generating, options: options), trace: trace)
     }
 
     /// Coalesces cumulative SDK snapshots and cancels the SDK iterator when the consumer terminates.
-    private func bridge<Content: Generable>(session: LanguageModelSession, stream: LanguageModelSession.ResponseStream<Content>)
-        -> AsyncThrowingStream<Content.PartiallyGenerated, any Error> where Content.PartiallyGenerated: Sendable {
-        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let producer = Task { @MainActor in
-                defer { withExtendedLifetime(session) {} }
-                do {
-                    for try await snapshot in stream {
-                        try Task.checkCancellation()
-                        if case .terminated = continuation.yield(snapshot.content) { throw CancellationError() }
-                    }
-                    try Task.checkCancellation()
-                    let final = try await stream.collect()
-                    try Task.checkCancellation()
-                    continuation.yield(final.content.asPartiallyGenerated())
-                    continuation.finish()
-                } catch { continuation.finish(throwing: error) }
+    private func bridge<Content: Generable>(session: LanguageModelSession, stream: LanguageModelSession.ResponseStream<Content>,
+        trace: NativeInferenceTrace)
+        -> RoutingProviderStream<Content.PartiallyGenerated> where Content.PartiallyGenerated: Sendable {
+        RoutingProviderStream { continuation in
+            var succeeded = false
+            defer { trace.finish(succeeded: succeeded); withExtendedLifetime(session) {} }
+            for try await snapshot in stream {
+                try Task.checkCancellation()
+                if case .terminated = continuation.yield(snapshot.content) { throw CancellationError() }
             }
-            continuation.onTermination = { _ in producer.cancel() }
+            try Task.checkCancellation()
+            let final = try await stream.collect()
+            try Task.checkCancellation()
+            continuation.yield(final.content.asPartiallyGenerated())
+            succeeded = true
         }
     }
 }
@@ -134,37 +149,28 @@ extension FoundationModelsBackend {
     func availability(for policy: RoutingPolicy) -> RoutingAvailability {
         let value = availability
         return .init(onDevice: policy != .cloudRequired && value.onDevice,
-            cloud: policy != .localOnly && value.cloud)
+            cloud: policy != .localOnly && value.cloud, cloudQuota: value.cloudQuota)
     }
 
     /// Supplies a one-snapshot stream for lightweight injected test providers.
     func textStream(route: InferenceRoute, prompt: String, instructions: String?, options: GenerationOptions)
-        -> AsyncThrowingStream<String, any Error> {
-        AsyncThrowingStream { continuation in
-            let producer = Task { @MainActor in
-                do {
-                    continuation.yield(try await text(route: route, prompt: prompt, instructions: instructions, options: options))
-                    continuation.finish()
-                } catch { continuation.finish(throwing: error) }
-            }
-            continuation.onTermination = { _ in producer.cancel() }
+        -> RoutingProviderStream<String> {
+        RoutingProviderStream { continuation in
+            let value = try await text(route: route, prompt: prompt, instructions: instructions, options: options)
+            try Task.checkCancellation()
+            continuation.yield(value)
         }
     }
 
     /// Supplies fully-generated content as one native partial value for injected tests.
     func structuredStream<Content: Generable>(route: InferenceRoute, prompt: String, instructions: String?,
-        options: GenerationOptions, generating: Content.Type) -> AsyncThrowingStream<Content.PartiallyGenerated, any Error>
+        options: GenerationOptions, generating: Content.Type) -> RoutingProviderStream<Content.PartiallyGenerated>
         where Content.PartiallyGenerated: Sendable {
-        AsyncThrowingStream { continuation in
-            let producer = Task { @MainActor in
-                do {
-                    let value = try await structured(route: route, prompt: prompt, instructions: instructions,
-                        options: options, generating: generating)
-                    continuation.yield(value.asPartiallyGenerated())
-                    continuation.finish()
-                } catch { continuation.finish(throwing: error) }
-            }
-            continuation.onTermination = { _ in producer.cancel() }
+        RoutingProviderStream { continuation in
+            let value = try await structured(route: route, prompt: prompt, instructions: instructions,
+                options: options, generating: generating)
+            try Task.checkCancellation()
+            continuation.yield(value.asPartiallyGenerated())
         }
     }
 }

@@ -1,15 +1,33 @@
 import Foundation
 
+/// A provider's quota signal; unknown means no quota information was supplied by a custom provider.
+public nonisolated enum CloudQuotaStatus: String, Sendable, Equatable {
+    case unknown, available, approachingLimit, exhausted
+}
+
 /// Provider readiness supplied by an adapter or app without recording identity or model content.
 public nonisolated struct RoutingAvailability: Equatable, Sendable {
     public let onDevice: Bool
     public let cloud: Bool
+    public let cloudQuota: CloudQuotaStatus
 
     /// Defaults to callable providers for compatibility with the closure-based API.
-    public init(onDevice: Bool = true, cloud: Bool = true) {
+    public init(onDevice: Bool = true, cloud: Bool = true, cloudQuota: CloudQuotaStatus = .unknown) {
         self.onDevice = onDevice
         self.cloud = cloud
+        self.cloudQuota = cloudQuota
     }
+
+    /// Treats quota conservation as provider eligibility, without adding a hidden latency preference.
+    func restricted(to policy: RoutingPolicy, conserveQuota: Bool) -> Self {
+        .init(onDevice: onDevice && policy != .cloudRequired,
+            cloud: cloud && policy != .localOnly && cloudQuota != .exhausted
+                && !(conserveQuota && policy == .automatic && cloudQuota == .approachingLimit),
+            cloudQuota: cloudQuota)
+    }
+
+    /// Optional calibration never consumes a provider's remaining near-limit quota.
+    var permitsCloudCalibration: Bool { cloud && cloudQuota != .approachingLimit && cloudQuota != .exhausted }
 }
 
 /// A weighted latency prediction and its recent variability, expressed in seconds.
@@ -24,6 +42,7 @@ public nonisolated enum RoutingReason: String, Sendable {
     case cloudRequired, localOnly, cloudPreferred, localCalibration, localFaster, offline
     case cloudBackoff, localBackoff, insufficientEvidence, cloudRefresh
     case localUnavailable, cloudUnavailable, localContextExceeded, noAvailableProvider
+    case cloudQuotaConserved
 }
 
 /// Describes the original selection; the result's actual route may differ after recovery.

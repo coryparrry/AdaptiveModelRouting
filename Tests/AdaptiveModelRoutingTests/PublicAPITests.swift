@@ -10,7 +10,7 @@ final class PublicAPITests: XCTestCase {
     func testShippedExample() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let generator = Generator(router: AdaptiveRouter(directory: directory, monitorConnection: false))
+        let generator = Generator(router: singleProviderRouter(directory: directory, monitorConnection: false))
         let output = try await generator.generate(inputTokens: 1_200, localContextCapacity: 8_192,
             cloud: { "cloud output" }, onDevice: { "local output" })
         XCTAssertEqual(output, "cloud output")
@@ -21,7 +21,7 @@ final class PublicAPITests: XCTestCase {
     func testRespondWithPublicClosures() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         var cloudCalls = 0
         var localCalls = 0
         let result = try await router.respond(inputTokens: 1_200, localContextCapacity: 8_192, cloud: {
@@ -42,7 +42,7 @@ final class PublicAPITests: XCTestCase {
     func testRespondLearnsUnavailabilityAndFallsBack() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         var cloudCalls = 0
         var localCalls = 0
         for _ in 0..<2 {
@@ -64,7 +64,7 @@ final class PublicAPITests: XCTestCase {
     func testRespondProviderFailureFallsBack() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         let output: String? = try await router.respond(inputTokens: 1_200, localContextCapacity: 8_192,
             cloud: { throw URLError(.notConnectedToInternet) }, onDevice: { "local recovery" })
         XCTAssertEqual(output, "local recovery")
@@ -77,7 +77,7 @@ final class PublicAPITests: XCTestCase {
     func testRespondReturnsNilForRequiredChunking() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false,
+        let router = singleProviderRouter(directory: directory, monitorConnection: false,
             configuration: .init(localResponseReserve: 1_000))
         let result: String? = try await router.respond(inputTokens: 7_500, localContextCapacity: 8_192,
             cloud: { nil }, onDevice: {
@@ -92,7 +92,7 @@ final class PublicAPITests: XCTestCase {
     func testRespondPreservesCancellation() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for explicit in [true, false] {
             let operation = Task {
                 try await router.respond(inputTokens: 1_200, localContextCapacity: 8_192, cloud: {
@@ -123,9 +123,9 @@ final class PublicAPITests: XCTestCase {
             profile.record(model: .onDevice, tokens: 1_200, seconds: 1, connection: connection, now: date)
             profile.record(model: .cloud, tokens: 1_200, seconds: 1.2, connection: connection, now: date)
         }
-        XCTAssertEqual(profile.choose(inputTokens: 1_200, localCapacity: 8_192, connection: connection, now: now), .cloud)
+        XCTAssertEqual(profile.choose(inputTokens: 1_200, localCapacity: 8_192, connection: connection, now: now), .onDevice)
         XCTAssertEqual(profile.choose(inputTokens: 1_200, localCapacity: 8_192, connection: connection, now: now,
-            configuration: .init(minimumLocalSavingSeconds: 0, minimumLocalSavingFraction: 0)), .onDevice)
+            configuration: .balanced), .cloud)
     }
 
     /// Existing prototype caches decode into the package's provider-neutral route name.

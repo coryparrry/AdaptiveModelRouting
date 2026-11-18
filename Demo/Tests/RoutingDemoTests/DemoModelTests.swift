@@ -17,6 +17,7 @@ final class DemoModelTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         XCTAssertEqual(model.mode, .simulated)
         XCTAssertEqual(model.policy, .local)
+        XCTAssertEqual(model.preset, .fastest)
         XCTAssertFalse(model.persistCalibration)
         model.start()
         await model.waitUntilFinished()
@@ -95,4 +96,23 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.storageLabel, "In memory")
         XCTAssertNil(model.errorMessage)
     }
+
+    /// Reopening the app retains explicit disk opt-in and learns from the saved profile immediately.
+    func testWarmReopenRetainsSavedCalibration() async {
+        let (first, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        first.start()
+        await first.waitUntilFinished()
+        first.setPersistence(true)
+        XCTAssertEqual(first.sampleCount, 1)
+        let reopened = DemoModel(cacheRoot: root)
+        XCTAssertTrue(reopened.persistCalibration)
+        reopened.start()
+        await reopened.waitUntilFinished()
+        XCTAssertEqual(reopened.sampleCount, 2)
+        XCTAssertEqual(reopened.storageLabel, "Saved")
+        reopened.setPersistence(false)
+        XCTAssertFalse(DemoModel(cacheRoot: root).persistCalibration)
+    }
+
 }
