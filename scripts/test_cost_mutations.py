@@ -54,7 +54,7 @@ def mutations() -> list[dict]:
                     "{ _ = try await onDevice(context, false); return try await onDevice(context, false) }")]},
         {"name": "change-cloud-probe-cadence", "filter": "QuotaScheduleTests.testExactCadenceAndCooldown",
          "edits": [(coordinator, "requestsSinceProbe >= frequency", "requestsSinceProbe > frequency")]},
-        {"name": "probe-before-refresh-is-due", "filter": matrix,
+        {"name": "probe-before-refresh-is-due", "filter": "QuotaScheduleTests.testExactCadenceAndCooldown",
          "edits": [(coordinator, "guard required || requestsSinceProbe >= frequency else { return false }", "guard true else { return false }")]},
         {"name": "ignore-single-provider-opt-out", "filter": matrix,
          "edits": [("Sources/AdaptiveModelRouting/RoutingConfiguration.swift", "self.calibration = calibration",
