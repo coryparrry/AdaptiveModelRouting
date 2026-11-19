@@ -57,6 +57,32 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.attempts.map(\.route), ["Cloud"])
     }
 
+    /// A provider switch clears the previous request's response and diagnostics, including partial errors.
+    func testChangingProvidersClearsDisplayedRequest() async {
+        for fault in [DemoFault.none, .afterOutput] {
+            let (model, root) = model()
+            defer { try? FileManager.default.removeItem(at: root) }
+            model.fault = fault
+            model.policy = .cloud
+            model.start()
+            await model.waitUntilFinished()
+            XCTAssertFalse(model.output.isEmpty)
+            XCTAssertFalse(model.attempts.isEmpty)
+            XCTAssertEqual(model.errorMessage != nil, fault == .afterOutput)
+
+            model.mode = .apple
+            XCTAssertTrue(model.output.isEmpty)
+            XCTAssertTrue(model.attempts.isEmpty)
+            XCTAssertNil(model.errorMessage)
+            XCTAssertEqual(model.status, "Ready")
+            XCTAssertEqual(model.selectionReason, "No request yet")
+            XCTAssertEqual(model.sampleCount, 0)
+            model.mode = .simulated
+            XCTAssertEqual(model.sampleCount, fault == .none ? 1 : 0)
+            XCTAssertTrue(model.output.isEmpty)
+        }
+    }
+
     /// A stalled fixture shows a deadline error and leaves the app ready for a later run.
     func testDeadlineAndCancellationFlows() async {
         let (model, root) = model()

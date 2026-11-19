@@ -4,6 +4,8 @@ import contextlib
 import hashlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -34,10 +36,106 @@ class LauncherTests(unittest.TestCase):
         constants = patch.multiple(launcher, ROOT=self.root, BASE=base, APP=app, BINARY=binary)
         constants.start()
         self.addCleanup(constants.stop)
+        signing_environment = patch.dict(os.environ, {'ROUTING_DEMO_SIGNING_ASSETS': ''})
+        signing_environment.start()
+        self.addCleanup(signing_environment.stop)
         (base / 'provenance.json').write_text(json.dumps({
             'binarySHA256': hashlib.sha256(binary.read_bytes()).hexdigest(),
             'sourceFiles': launcher.source_hashes(),
         }))
+
+    def stage_fixture(self):
+        """Stage a synthetic compiled binary while requiring build-only to leave process ownership untouched."""
+        compiled = self.root / '.build/demo-gui-build/debug/RoutingDemo'
+        compiled.parent.mkdir(parents=True, exist_ok=True)
+        compiled.write_bytes(b'new executable')
+        with patch.object(sys, 'argv', ['launcher', '--build-only']), patch.object(launcher, 'running_pid') as pid, \
+                patch.object(launcher, 'run_logged') as logged, patch.object(launcher.subprocess, 'run') as launch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            launcher.main()
+            self.assertEqual([call.args[0] for call in logged.call_args_list], ['build', 'sign', 'verify'])
+            pid.assert_not_called()
+            launch.assert_not_called()
+
+    def test_build_only_stages_separate_signed_candidate(self):
+        """A completed build leaves the previous live bundle, provenance and launch record intact."""
+        launch_record = launcher.BASE / 'last-launch.json'
+        launch_record.write_text('{"pid": 123}')
+        prior_manifest = (launcher.BASE / 'provenance.json').read_bytes()
+        self.stage_fixture()
+        self.assertEqual(launch_record.read_text(), '{"pid": 123}')
+        self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+        self.assertEqual((launcher.BASE / 'provenance.json').read_bytes(), prior_manifest)
+        staged = launcher.BASE / 'staged' / launcher.APP.name
+        self.assertEqual((staged / 'Contents/MacOS/RoutingDemo').read_bytes(), b'new executable')
+        with patch.object(sys, 'argv', ['launcher', '--verify']), patch.object(launcher, 'run_logged') as logged:
+            launcher.main()
+            self.assertEqual(logged.call_args.args[1][-1], str(staged))
+
+    def test_failed_build_or_sign_preserves_live_and_prior_candidate(self):
+        """Both the active session and its verified replacement survive failures before promotion."""
+        self.stage_fixture()
+        prior = launcher.BASE / 'staged'
+        snapshot = (prior / 'provenance.json').read_bytes()
+        for mode in ('run', '--build-only'):
+            for stage in ('build', 'sign', 'verify'):
+                with self.subTest(mode=mode, stage=stage):
+                    def fail_step(name, command, environment):
+                        """Fail at the selected prerequisite."""
+                        if name == stage:
+                            raise subprocess.CalledProcessError(1, command)
+                    with patch.object(sys, 'argv', ['launcher', mode]), patch.object(launcher, 'stop_running_demo') as stop, \
+                            patch.object(launcher, 'run_logged', side_effect=fail_step), patch.object(launcher.subprocess, 'run') as launch:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            launcher.main()
+                        stop.assert_not_called()
+                        launch.assert_not_called()
+                    self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+                    self.assertEqual((prior / 'provenance.json').read_bytes(), snapshot)
+
+    def test_launch_only_promotes_verified_build(self):
+        """Launch uses the newly staged binary after verifying the copy and stopping the owned previous app."""
+        self.stage_fixture()
+        events = []
+
+        def verify(name, command, environment):
+            """Record the hash-checked signatures preceding the ownership handoff."""
+            events.append(name)
+            self.assertEqual((Path(command[-1]) / 'Contents/MacOS/RoutingDemo').read_bytes(), b'new executable')
+
+        def stop():
+            """Require the old executable to remain in place until the stop."""
+            events.append('stop')
+            self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+
+        def open_demo(command, check):
+            """Confirm Launch Services receives the promoted live bundle."""
+            events.append('open')
+            self.assertEqual(command, ['/usr/bin/open', '-n', str(launcher.APP)])
+            self.assertEqual(launcher.BINARY.read_bytes(), b'new executable')
+
+        with patch.object(sys, 'argv', ['launcher', '--launch-only']), patch.object(launcher, 'run_logged', side_effect=verify), \
+                patch.object(launcher, 'stop_running_demo', side_effect=stop), patch.object(launcher, 'running_pid', return_value=456), \
+                patch.object(launcher.subprocess, 'run', side_effect=open_demo), contextlib.redirect_stdout(io.StringIO()):
+            launcher.main()
+        self.assertEqual(events, ['verify-launch', 'verify-launch', 'stop', 'open'])
+        self.assertEqual(json.loads((launcher.BASE / 'last-launch.json').read_text())['pid'], 456)
+        self.assertEqual((launcher.BASE / 'provenance.json').read_bytes(), (launcher.BASE / 'staged/provenance.json').read_bytes())
+
+    def test_manifest_install_failure_restores_live_bundle(self):
+        """An interrupted promotion leaves the previous binary and manifest together for retry."""
+        self.stage_fixture()
+        previous = (launcher.BASE / 'provenance.json').read_bytes()
+        with patch.object(sys, 'argv', ['launcher', '--launch-only']), patch.object(launcher, 'run_logged'), \
+                patch.object(launcher, 'stop_running_demo'), patch.object(Path, 'replace', side_effect=PermissionError), \
+                patch.object(launcher.subprocess, 'run') as launch:
+            with self.assertRaises(PermissionError):
+                launcher.main()
+            launch.assert_not_called()
+        self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+        self.assertEqual((launcher.BASE / 'provenance.json').read_bytes(), previous)
+        staged_binary = launcher.BASE / 'staged' / launcher.BINARY.relative_to(launcher.BASE)
+        self.assertEqual(staged_binary.read_bytes(), b'new executable')
 
     def test_launch_only_requires_exact_input_set(self):
         """Adding, removing or editing a source rejects launch before disturbing the current app."""

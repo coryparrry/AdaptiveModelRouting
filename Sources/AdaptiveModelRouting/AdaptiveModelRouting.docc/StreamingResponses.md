@@ -26,7 +26,7 @@ Keep the handle in the view model if the user can stop generation. Call `task.ca
 
 A recoverable failure before the first published snapshot may use the other permitted provider. After the first snapshot is published, errors propagate and visible output is never silently restarted with another model. The failed provider can still receive health backoff.
 
-An empty cloud stream is unavailable and may recover locally. An empty local stream throws ``RoutingRequestError/emptyStream``. Cloud-required and local-only constraints remain binding for streams.
+An empty cloud stream is unavailable and may recover locally under `.automatic`. An empty local stream produces ``RoutingRequestError/emptyStream``. Under `.automatic`, the default error classifier allows the router to recover using an eligible cloud provider, which can spend cloud quota. Under `.localOnly`, the error reaches the caller and the request stays on device.
 
 ## Bounded snapshots
 

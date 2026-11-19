@@ -159,9 +159,7 @@ public final class DemoModel {
         let policy = policy.value
         let fault = fault
         let deadline = RoutingDeadline.after(.seconds(max(0.001, deadlineSeconds)))
-        output = ""
-        attempts = []
-        errorMessage = nil
+        clearDisplayedRequest()
         status = "Generating…"
         isRunning = true
         let observer: (RoutingAttempt) -> Void = { [weak self] attempt in
@@ -284,12 +282,22 @@ public final class DemoModel {
 
     /// Applies the current preset and resumes the returning mode's opted-in disk cache.
     private func enterMode() {
+        clearDisplayedRequest()
+        status = "Ready"
         activeRouter.updateSelectionThresholds(from: preset.value)
         if persistCalibration && activeRouter.persistence == .memoryOnly {
             do { try activeRouter.setPersistence(.disk) }
             catch { errorMessage = error.localizedDescription }
         }
         refreshProfile()
+    }
+
+    /// Clears the previous response and its diagnostics before the next provider or request is shown.
+    private func clearDisplayedRequest() {
+        output = ""
+        attempts = []
+        errorMessage = nil
+        selectionReason = "No request yet"
     }
 
     /// Opens a workload on first use with its own persisted storage choice.

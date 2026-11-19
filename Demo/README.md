@@ -18,6 +18,6 @@ swift test --package-path Demo
 
 The sample has one package dependency, `AdaptiveModelRouting`. Its internal support target lets the app's asynchronous state flow be tested without opening a GUI.
 
-The run script stages a real macOS app bundle and launches it through Launch Services. Ad-hoc signing supports the simulated demo. Real PCC testing additionally requires a development identity and an approved provisioning profile; signing assets can be supplied through `ROUTING_DEMO_SIGNING_ASSETS` and `ROUTING_DEMO_SIGNING_IDENTITY`.
+The run script stages a signed macOS app bundle and launches it through Launch Services. Use `./script/build_and_run.sh --build-only` to prepare a candidate while keeping the running demo open. Use `--verify` to check the staged candidate or `--launch-only` to switch to it. Ad-hoc signing supports the simulated demo. Real PCC testing additionally requires a development identity and an approved provisioning profile; signing assets can be supplied through `ROUTING_DEMO_SIGNING_ASSETS` and `ROUTING_DEMO_SIGNING_IDENTITY`.
 
 For content-free native call diagnostics, use `./script/build_and_run.sh --telemetry`. The `AdaptiveModelRouting` / `NativeInference` unified debug log records invocation IDs, route, format, completion and duration, without prompts or answers.
