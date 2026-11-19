@@ -77,7 +77,7 @@ private struct DemoStoragePreferences: Codable {
     }
 }
 
-/// Retains one router owner for the current provider mode across preset changes.
+/// Keeps a provider's adapter and its calibration state together.
 @MainActor
 private enum DemoRoutingOwner {
     case simulated(AdaptiveRouter)
@@ -98,7 +98,8 @@ private enum DemoRoutingOwner {
 public final class DemoModel {
     public var prompt = "Summarize the trade-offs between local and cloud models."
     public var mode: DemoMode = .simulated {
-        didSet { if mode != oldValue { replaceOwner() } }
+        willSet { if mode != newValue { leaveMode() } }
+        didSet { if mode != oldValue { enterMode() } }
     }
     public var policy: DemoPolicy = .local
     public var preset: DemoPreset = .fastest {
@@ -127,7 +128,14 @@ public final class DemoModel {
     @ObservationIgnored private var visibleWindows = Set<UUID>()
     @ObservationIgnored private let cacheRoot: URL
     private var storagePreferences = DemoStoragePreferences()
-    @ObservationIgnored private lazy var owner = makeOwner()
+    @ObservationIgnored private lazy var simulatedOwner = makeOwner(for: .simulated)
+    @ObservationIgnored private lazy var appleOwner = makeOwner(for: .apple)
+    private var owner: DemoRoutingOwner {
+        switch mode {
+        case .simulated: simulatedOwner
+        case .apple: appleOwner
+        }
+    }
     var activeRouter: AdaptiveRouter { owner.router }
 
     /// Starts with fixture routing and restores only the user's explicit calibration-storage preference.
@@ -266,20 +274,28 @@ public final class DemoModel {
         refreshProfile()
     }
 
-    /// Retires the previous owner before another router can read or write the same cache.
-    private func replaceOwner() {
+    /// Stops the outgoing mode's work and disk writes while keeping its in-memory state.
+    private func leaveMode() {
         cancel()
-        // The memory-only transition with clearing disabled does no file I/O. A late SDK
-        // error can still carry a retry hint, but the retired owner can no longer write the file.
-        try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
-        owner = makeOwner()
+        if activeRouter.persistence == .disk {
+            try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
+        }
+    }
+
+    /// Applies the current preset and resumes the returning mode's opted-in disk cache.
+    private func enterMode() {
+        activeRouter.updateSelectionThresholds(from: preset.value)
+        if persistCalibration && activeRouter.persistence == .memoryOnly {
+            do { try activeRouter.setPersistence(.disk) }
+            catch { errorMessage = error.localizedDescription }
+        }
         refreshProfile()
     }
 
-    /// Opens the selected workload with its own persisted storage choice.
-    private func makeOwner() -> DemoRoutingOwner {
+    /// Opens a workload on first use with its own persisted storage choice.
+    private func makeOwner(for mode: DemoMode) -> DemoRoutingOwner {
         let configuration = preset.value
-        let persistence: RoutingPersistence = persistCalibration ? .disk : .memoryOnly
+        let persistence: RoutingPersistence = storagePreferences[mode] ? .disk : .memoryOnly
         switch mode {
         case .apple:
             return .apple(FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.",

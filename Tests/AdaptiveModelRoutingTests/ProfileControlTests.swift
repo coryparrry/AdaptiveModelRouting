@@ -217,7 +217,10 @@ final class ProfileControlTests: XCTestCase {
             try owner.setPersistence(.disk)
             XCTAssertEqual(owner.storageStatus, .unavailable)
 
+            // Switching away from a demo mode temporarily detaches its retained owner.
+            try owner.setPersistence(.memoryOnly, clearExistingCache: false)
             try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            try owner.setPersistence(.disk)
             _ = try await owner.measure(model: .onDevice, inputTokens: 300, snapshot: owner.snapshot()) { 1 }
             let reopened = singleProviderRouter(directory: directory, monitorConnection: false)
             XCTAssertEqual(reopened.profile.samples.map(\.tokens), initialMode == .disk ? [100, 200, 300] : [200, 300])

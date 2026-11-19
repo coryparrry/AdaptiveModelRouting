@@ -253,11 +253,6 @@ public final class AdaptiveRouter {
                         if route == .cloud {
                             guard cloudPermission(true),
                                   self.calibration.permitsOptionalCloud(interval: self.configuration.cloudRetryInterval) else { return nil }
-                            try probeContext.checkActive()
-                            self.calibration.recordCloudUse()
-                            // Persist the reservation before timing the provider. If storage uses up the
-                            // probe budget, track rejects dispatch without recording a provider attempt.
-                            self.save()
                         } else if !localPermission() { return nil }
                         return try await self.track(model: route, inputTokens: inputTokens, snapshot: snapshot,
                             workload: workload, context: probeContext, comparisonID: pairID, available: { $0 != nil }) {
@@ -285,12 +280,7 @@ public final class AdaptiveRouter {
                    let outcome = try await consumeProbe(probe, context: context, onValue: onProbeFallback) { return outcome }
                 guard cloudPermission(false) else { return .skipped }
                 let value = try await track(model: .cloud, inputTokens: inputTokens, snapshot: snapshot,
-                    workload: workload, context: context, comparisonID: comparisonID, available: { $0 != nil }) {
-                        self.calibration.recordCloudUse()
-                        self.save()
-                        try context.checkActive()
-                        return try await cloud(context, false)
-                    }
+                    workload: workload, context: context, comparisonID: comparisonID, available: { $0 != nil }) { try await cloud(context, false) }
                 return .returned(value)
             }, onDevice: {
                 if let probe, probe.route == .onDevice,
@@ -344,6 +334,12 @@ public final class AdaptiveRouter {
     private func track<Value>(model: InferenceRoute, inputTokens: Int, snapshot: Snapshot, workload: RoutingWorkload,
         context: RoutingRequestContext, comparisonID: UUID?, available: (Value) -> Bool, operation: @MainActor () async throws -> Value
     ) async throws -> Value {
+        if model == .cloud {
+            try context.checkActive()
+            calibration.recordCloudUse()
+            save()
+        }
+        // Recheck the budget after persistence so only a dispatched provider is timed.
         try context.begin(model)
         do {
             let value = try await measure(model: model, inputTokens: inputTokens, snapshot: snapshot,
@@ -599,7 +595,7 @@ public final class AdaptiveRouter {
     /// Changes storage policy; disabling disk storage clears the owned cache by default.
     public func setPersistence(_ value: RoutingPersistence, clearExistingCache: Bool = true) throws {
         if value == .disk {
-            if persistence == .disk, case .awaitingRead = cacheAccess {
+            if case .awaitingRead = cacheAccess {
                 try? retryPendingCacheRead()
             } else {
                 try? loadCache(restoring: nil)

@@ -30,18 +30,21 @@ final class RoutingRequestContext {
     private var termination: (any Error)?
     private var attempt: (route: InferenceRoute, started: ContinuousClock.Instant)?
     private let observer: ((RoutingAttempt) -> Void)?
+    private let now: () -> ContinuousClock.Instant
     private(set) var attempts: [RoutingAttempt] = []
     var onAbort: (() -> Void)?
     var onWorkerFinished: (() -> Void)?
 
     /// Resolves a positive monotonic deadline before preflight starts.
-    init(deadline: RoutingDeadline, observer: ((RoutingAttempt) -> Void)?) throws {
+    init(deadline: RoutingDeadline, now: @escaping () -> ContinuousClock.Instant = { .now },
+        observer: ((RoutingAttempt) -> Void)?) throws {
         switch deadline {
         case .after(let duration):
             guard duration > .zero else { throw RoutingRequestError.invalidDeadline }
-            cutoff = .now.advanced(by: duration)
+            cutoff = now().advanced(by: duration)
         case .unlimited: cutoff = nil
         }
+        self.now = now
         self.observer = observer
     }
 
@@ -49,7 +52,7 @@ final class RoutingRequestContext {
     func checkActive() throws {
         try Task.checkCancellation()
         if let termination { throw termination }
-        if let cutoff, ContinuousClock.now >= cutoff { throw RoutingRequestError.deadlineExceeded }
+        if let cutoff, now() >= cutoff { throw RoutingRequestError.deadlineExceeded }
         guard active else { throw CancellationError() }
     }
 
@@ -62,7 +65,7 @@ final class RoutingRequestContext {
     /// Starts timing only an inference operation, not tokenization or unavailable-provider checks.
     func begin(_ route: InferenceRoute) throws {
         try checkActive()
-        attempt = (route, .now)
+        attempt = (route, now())
     }
 
     /// Drops a fallback wait when its optional worker declined before invoking any provider.
@@ -98,7 +101,7 @@ final class RoutingRequestContext {
 
     /// Converts monotonic elapsed time into diagnostic seconds.
     private func seconds(since start: ContinuousClock.Instant) -> Double {
-        let components = start.duration(to: .now).components
+        let components = start.duration(to: now()).components
         return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

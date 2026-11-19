@@ -70,6 +70,32 @@ final class RequestControlTests: XCTestCase {
         }
     }
 
+    /// A deadline reached during the first cloud pacing write expires without reporting a provider attempt.
+    func testDeadlineDuringCloudReservationDoesNotCountAnAttempt() async throws {
+        let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let router = AdaptiveRouter(directory: directory, monitorConnection: false,
+            configuration: .init(calibration: .singleProvider))
+        let cache = directory.appendingPathComponent("latency.json")
+        let start = ContinuousClock.now
+        var attempts: [RoutingAttempt] = []
+        // Move time to the cutoff as soon as the real reservation reaches disk.
+        let context = try RoutingRequestContext(deadline: .after(.seconds(1)), now: {
+            FileManager.default.fileExists(atPath: cache.path) ? start.advanced(by: .seconds(1)) : start
+        }, observer: { attempts.append($0) })
+        do {
+            _ = try await router.performDetailed(context: context, inputTokens: 100, localContextCapacity: 8_192,
+                policy: .cloudRequired, workload: .init(), availability: .init(), shouldFallback: { _, _ in false },
+                cloud: { _, _ in XCTFail("Expired reservation reached cloud"); return "cloud" },
+                onDevice: { _, _ in XCTFail("Cloud-required request reached local"); return "local" })
+            XCTFail("Expected the request deadline")
+        } catch RoutingRequestError.deadlineExceeded {}
+        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: cache)) as? [String: Any]
+        XCTAssertNotNil(saved?["lastCloudUse"])
+        XCTAssertTrue(attempts.isEmpty)
+        XCTAssertTrue(router.profile.samples.isEmpty)
+    }
+
     /// A deadline returns before a noncooperative provider completes and prevents late health/training updates.
     func testDeadlineReturnsBeforeProviderAndSuppressesLateResult() async throws {
         let router = router(configuration: .init(slowCloudAfter: .milliseconds(400)))

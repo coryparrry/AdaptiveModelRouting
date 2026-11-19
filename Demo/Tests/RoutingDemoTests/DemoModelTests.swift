@@ -183,6 +183,21 @@ final class DemoModelTests: XCTestCase {
         try await assertEditPreservesInMemoryTimingsAndCloudThrottle { $0.deadlineSeconds = 1 }
     }
 
+    /// Each provider mode keeps its own timings and server retry date across a round trip.
+    func testModeRoundTripPreservesInMemoryTimingsAndCloudThrottle() async throws {
+        try await assertEditPreservesInMemoryTimingsAndCloudThrottle { model in
+            model.mode = .apple
+            XCTAssertEqual(model.sampleCount, 0)
+            let apple = model.activeRouter
+            model.preset = .quality
+            model.mode = .simulated
+            XCTAssertEqual(model.activeRouter.configuration.minimumSamples, DemoPreset.quality.value.minimumSamples)
+            model.mode = .apple
+            XCTAssertTrue(model.activeRouter === apple)
+            model.mode = .simulated
+        }
+    }
+
     /// Switching presets applies the selected thresholds while retaining the same history and server throttle.
     func testPresetChangePreservesInMemoryTimingsAndCloudThrottle() async throws {
         try await assertEditPreservesInMemoryTimingsAndCloudThrottle { model in
@@ -254,8 +269,8 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.activeRouter.lastCalibrationAttempt?.outcome, .succeeded)
     }
 
-    /// Changing provider mode cancels the old background probe and prevents late writes to its disk cache.
-    func testModeChangeRetiresDiskOwnerAfterForegroundCompletion() async throws {
+    /// Switching modes cancels the old probe and pauses writes until the disk-backed mode returns.
+    func testModeChangePausesAndResumesDiskOwnerAfterForegroundCompletion() async throws {
         let (model, root) = model()
         defer { try? FileManager.default.removeItem(at: root) }
         model.setPersistence(true)
@@ -270,6 +285,10 @@ final class DemoModelTests: XCTestCase {
         let current = try Data(contentsOf: file)
         _ = try await oldRouter.measure(model: .onDevice, inputTokens: 10, snapshot: oldRouter.snapshot()) { 1 }
         XCTAssertEqual(try Data(contentsOf: file), current)
+        model.mode = .simulated
+        XCTAssertTrue(model.activeRouter === oldRouter)
+        XCTAssertEqual(model.activeRouter.storageStatus, .persisted)
+        XCTAssertNotEqual(try Data(contentsOf: file), current)
     }
 
     /// A lone window can stop optional generation even after the main request has already completed.
