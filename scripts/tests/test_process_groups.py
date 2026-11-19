@@ -28,11 +28,13 @@ class ProcessGroupTests(unittest.TestCase):
                 process_groups.stop_process(process, grace_seconds=0.1)
                 self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'Child survived group cleanup')
                 self.assertEqual(process.stdout.read(), b'')
-            finally:
+            except BaseException:
+                # Successful EOF verification already proves the fixture exited.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
+                raise
 
     def test_mutation_runner_uses_group_cleanup_on_timeout_and_interruption(self):
         """Both exits release the group and preserve the correct failure type before another mutation runs."""
