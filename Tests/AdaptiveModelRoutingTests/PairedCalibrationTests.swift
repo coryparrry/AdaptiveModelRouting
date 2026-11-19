@@ -55,17 +55,30 @@ final class PairedCalibrationTests: XCTestCase {
 
     /// Rechecks the alternative on the configured cadence and switches when its measured performance improves.
     func testContinuedCalibrationCanSwitchBackToCloud() async throws {
-        let router = router(minimum: 1, every: 2)
+        let router = router(minimum: 1, every: 2, cloudRetryInterval: 0.1)
         var cloudCalls = 0
         let _: String? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
-            cloud: { cloudCalls += 1; try await Task.sleep(for: .milliseconds(40)); return "cloud" }, onDevice: { "local" })
+            cloud: {
+                cloudCalls += 1
+                await router.waitForCalibration()
+                // Let the paid cooldown elapse while the first cloud response is still in flight.
+                try await Task.sleep(for: .milliseconds(150))
+                return "cloud"
+            }, onDevice: { "local" })
         await router.waitForCalibration()
         let first = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
             cloud: { XCTFail("Only one eligible request since the last probe."); return "cloud" }, onDevice: { "local" })
         XCTAssertEqual(first.route, .onDevice)
         let second = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8_192,
             cloud: { cloudCalls += 1; return "faster cloud" },
-            onDevice: { try await Task.sleep(for: .milliseconds(50)); return "slower local" })
+            onDevice: {
+                await router.waitForCalibration()
+                let cloudTimes = router.profile.samples.filter { $0.model == .cloud }.map(\.seconds)
+                // The newest local sample outweighs the two older fast ones even on a busy runner.
+                let slowLocal = 2 * (try XCTUnwrap(cloudTimes.max()))
+                try await Task.sleep(for: .seconds(slowLocal))
+                return "slower local"
+            })
         XCTAssertEqual(second.route, .onDevice)
         await router.waitForCalibration()
         XCTAssertEqual(cloudCalls, 2)
