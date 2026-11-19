@@ -41,7 +41,11 @@ final class WorkloadEstimationTests: XCTestCase {
         var profile = trained(workload: .init(cloudSession: .reused))
         XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now,
             workload: .init(cloudSession: .reused)), .onDevice)
-        XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now), .cloud)
+        let fresh = profile.decision(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now)
+        XCTAssertEqual(fresh.route, .onDevice)
+        XCTAssertEqual(fresh.reason, .insufficientEvidence)
+        XCTAssertNotNil(fresh.localEstimate)
+        XCTAssertNil(fresh.cloudEstimate, "Reused cloud sessions cannot supply a fresh-session estimate.")
         let reused = RoutingWorkload(localSession: .reused, cloudSession: .reused)
         profile.record(model: .onDevice, tokens: 1_000, seconds: 0.1, connection: wifi, now: now, workload: reused)
         XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now,
@@ -51,7 +55,8 @@ final class WorkloadEstimationTests: XCTestCase {
     /// A mean advantage is insufficient when either provider's recent latency has a wide spread.
     func testVariableLatencyRetainsCloudPreference() {
         for profile in [trained(cloud: [0.5, 5, 1.5]), trained(local: [0.1, 0.1, 3])] {
-            XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now), .cloud)
+            XCTAssertEqual(profile.choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now,
+                configuration: .balanced), .cloud)
         }
         XCTAssertEqual(trained().choose(inputTokens: 1_000, localCapacity: 8_192, connection: wifi, now: now), .onDevice)
     }
@@ -86,10 +91,10 @@ final class WorkloadEstimationTests: XCTestCase {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let workload = RoutingWorkload(expectedOutputTokens: 600, localSession: .reused)
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         let _: Int? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
             workload: workload, cloud: { 1 }, onDevice: { 2 })
-        let restored = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let restored = singleProviderRouter(directory: directory, monitorConnection: false)
         XCTAssertEqual(restored.profile.samples.first?.workload, workload)
     }
 
@@ -98,7 +103,7 @@ final class WorkloadEstimationTests: XCTestCase {
     func testExpectedOutputAlsoReservesLocalCapacity() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false,
+        let router = singleProviderRouter(directory: directory, monitorConnection: false,
             configuration: .init(localResponseReserve: 100))
         let result: Int? = try await router.respond(inputTokens: 900, localContextCapacity: 1_000,
             workload: .init(expectedOutputTokens: 200), cloud: { nil },

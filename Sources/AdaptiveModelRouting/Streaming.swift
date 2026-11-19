@@ -41,6 +41,26 @@ extension AdaptiveRouter {
         cloud: @escaping @MainActor () async throws -> AsyncThrowingStream<Value, any Error>?,
         onDevice: @escaping @MainActor () async throws -> AsyncThrowingStream<Value, any Error>
     ) -> AsyncThrowingStream<RoutingStreamEvent<Value>, any Error> {
+        streamOwned(inputTokens: inputTokens, localContextCapacity: localContextCapacity,
+            policy: policy, workload: workload, availability: availability, deadline: deadline,
+            shouldFallback: shouldFallback, onAttempt: onAttempt,
+            cloud: {
+                guard let stream = try await cloud() else { return nil }
+                return RoutingProviderStream(unowned: stream)
+            }, onDevice: { RoutingProviderStream(unowned: try await onDevice()) })
+    }
+
+    /// Tracks actual producer exit so timeout/cancellation cannot start overlapping secondary inference.
+    /// Providers must await all generation work inside RoutingProviderStream's producer closure.
+    public func streamOwned<Value: Sendable>(
+        inputTokens: Int, localContextCapacity: Int,
+        policy: RoutingPolicy = .automatic, workload: RoutingWorkload = .init(),
+        availability: RoutingAvailability = .init(), deadline: RoutingDeadline? = nil,
+        shouldFallback: @escaping @MainActor (InferenceRoute, any Error) -> Bool = { _, error in InferenceExecutor.isRetryable(error) },
+        onAttempt: ((RoutingAttempt) -> Void)? = nil,
+        cloud: @escaping @MainActor () async throws -> RoutingProviderStream<Value>?,
+        onDevice: @escaping @MainActor () async throws -> RoutingProviderStream<Value>
+    ) -> AsyncThrowingStream<RoutingStreamEvent<Value>, any Error> {
         RoutingStreamFactory.make { continuation in
             try await self.withRequest(deadline: deadline, onAttempt: onAttempt) { context in
                 try await self.performStreaming(context: context, inputTokens: inputTokens,
@@ -54,41 +74,63 @@ extension AdaptiveRouter {
     /// Shares profile measurement, diagnostics and hard policy enforcement with non-streaming requests.
     func performStreaming<Value: Sendable>(context: RoutingRequestContext, inputTokens: Int, localContextCapacity: Int,
         policy: RoutingPolicy, workload: RoutingWorkload, availability: RoutingAvailability,
-        calibrationIdentifier: String? = nil, shouldFallback: (InferenceRoute, any Error) -> Bool,
+        calibrationIdentifier: String? = nil, shouldFallback: @escaping @MainActor (InferenceRoute, any Error) -> Bool,
+        cloudPermission: @escaping @MainActor (Bool) -> Bool = { _ in true },
+        localPermission: @escaping @MainActor () -> Bool = { true },
         continuation: AsyncThrowingStream<RoutingStreamEvent<Value>, any Error>.Continuation,
-        cloud: @MainActor () async throws -> AsyncThrowingStream<Value, any Error>?,
-        onDevice: @MainActor () async throws -> AsyncThrowingStream<Value, any Error>
+        cloud: @escaping @MainActor () async throws -> RoutingProviderStream<Value>?,
+        onDevice: @escaping @MainActor () async throws -> RoutingProviderStream<Value>
     ) async throws -> RoutingResult<Value> {
         var published = false
         return try await performDetailed(context: context, inputTokens: inputTokens, localContextCapacity: localContextCapacity,
             policy: policy, workload: workload, availability: availability, calibrationIdentifier: calibrationIdentifier,
             onDecision: { continuation.yield(.selected($0)) }, canFallback: { !published },
-            shouldFallback: shouldFallback, cloud: {
+            shouldFallback: shouldFallback, cloudPermission: cloudPermission, localPermission: localPermission,
+            onProbeFallback: { value, route in
+                if case .terminated = continuation.yield(.update(value, route: route)) { throw CancellationError() }
+                published = true
+            }, cloud: { scope, isCalibration in
                 guard let source = try await cloud() else { return nil }
-                return try await self.consume(source, route: .cloud, context: context,
-                    continuation: continuation, didPublish: { published = true })
-            }, onDevice: {
+                return try await self.consume(source, route: .cloud, context: scope,
+                    continuation: isCalibration ? nil : continuation, didPublish: { published = true })
+            }, onDevice: { scope, isCalibration in
                 let source = try await onDevice()
-                guard let value = try await self.consume(source, route: .onDevice, context: context,
-                    continuation: continuation, didPublish: { published = true }) else { throw RoutingRequestError.emptyStream }
+                guard let value = try await self.consume(source, route: .onDevice, context: scope,
+                    continuation: isCalibration ? nil : continuation, didPublish: { published = true }) else { throw RoutingRequestError.emptyStream }
                 return value
             })
     }
 
     /// Publishes only while the request is active and returns the final cumulative snapshot for result metadata.
-    private func consume<Value: Sendable>(_ source: AsyncThrowingStream<Value, any Error>, route: InferenceRoute,
+    private func consume<Value: Sendable>(_ source: RoutingProviderStream<Value>, route: InferenceRoute,
         context: RoutingRequestContext,
-        continuation: AsyncThrowingStream<RoutingStreamEvent<Value>, any Error>.Continuation,
+        continuation: AsyncThrowingStream<RoutingStreamEvent<Value>, any Error>.Continuation?,
         didPublish: () -> Void
     ) async throws -> Value? {
-        var last: Value?
-        for try await value in source {
-            try context.checkActive()
-            if case .terminated = continuation.yield(.update(value, route: route)) { throw CancellationError() }
-            didPublish()
-            last = value
+        let result: Result<Value?, any Error>
+        var cancelProducer = false
+        do {
+            var last: Value?
+            for try await value in source.stream {
+                try context.checkActive()
+                if let continuation {
+                    if case .terminated = continuation.yield(.update(value, route: route)) { throw CancellationError() }
+                    didPublish()
+                }
+                last = value
+            }
+            result = .success(last)
+        } catch {
+            if route == .cloud { recordRetryDeadline(error) }
+            cancelProducer = true
+            result = .failure(error)
         }
+        // A cancelled iterator can finish before a noncooperative producer returns its server reset date.
+        let producerError = await source.finishProducer(cancelling: cancelProducer)
+        if let producerError, route == .cloud { recordRetryDeadline(producerError) }
+        let value = try result.get()
         try context.checkActive()
-        return last
+        if let producerError { throw producerError }
+        return value
     }
 }

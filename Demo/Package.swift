@@ -5,7 +5,7 @@ let package = Package(
     name: "RoutingDemo",
     platforms: [.macOS("27.0")],
     products: [.executable(name: "RoutingDemo", targets: ["RoutingDemo"])],
-    dependencies: [.package(path: "..")],
+    dependencies: [.package(name: "AdaptiveModelRouting", path: "..")],
     targets: [
         .target(name: "RoutingDemoSupport", dependencies: [.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")]),
         .executableTarget(name: "RoutingDemo", dependencies: ["RoutingDemoSupport"]),

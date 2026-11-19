@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Run the package's offline launch checks and collect concise, attributable evidence."""
 
+from __future__ import annotations
+
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -11,21 +14,13 @@ import sys
 import time
 from pathlib import Path
 
+if __package__:
+    from .process_groups import stop_process
+else:
+    from process_groups import stop_process
+
+
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def stop_process(process: subprocess.Popen) -> None:
-    """Cancel the owned process group so timeout or interruption does not strand compiler children."""
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    except ProcessLookupError:
-        process.wait()
 
 
 def failure_excerpt(lines: list[str]) -> str:
@@ -34,6 +29,18 @@ def failure_excerpt(lines: list[str]) -> str:
     failures = [line for line in lines[:tail_start]
                 if re.search(r"error:|\bfailed\b|\b[1-9]\d* failures?\b|exceeded", line, re.IGNORECASE)]
     return "\n".join(failures[:20] + lines[tail_start:])
+
+
+def write_summary(artifacts: Path, results: list, status: str, error: str = "", exit_code: int | None = None) -> None:
+    """Atomically report current-run state while preserving completed summaries' list of stage records."""
+    records = list(results)
+    if status == "failed" and records and records[-1]["exitCode"] != 0:
+        records[-1] = dict(records[-1], status=status)
+    elif status != "passed":
+        records.append({"step": "validation", "status": status, "exitCode": exit_code, "detail": error})
+    temporary = artifacts / f".summary-{os.getpid()}.tmp"
+    temporary.write_text(json.dumps(records, indent=2) + "\n")
+    temporary.replace(artifacts / "summary.json")
 
 
 def run_step(name: str, command: list[str], artifacts: Path, environment: dict, results: list, timeout: float = 600) -> None:
@@ -56,7 +63,7 @@ def run_step(name: str, command: list[str], artifacts: Path, environment: dict, 
     record = {"step": name, "command": command, "exitCode": code,
               "seconds": round(time.monotonic() - started, 2), "log": log.name}
     results.append(record)
-    (artifacts / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+    write_summary(artifacts, results, "failed" if code else "running")
     print(f"{name}: {'passed' if code == 0 else 'FAILED'} ({record['seconds']}s)", flush=True)
     if code:
         print(failure_excerpt(log.read_text(errors="replace").splitlines()))
@@ -74,12 +81,42 @@ def main() -> None:
     args = parser.parse_args()
     artifacts = args.artifacts.resolve()
     artifacts.mkdir(parents=True, exist_ok=True)
+    # Keep a stable lock inode across runs. Closing the descriptor also releases it after interruption.
+    with (artifacts / ".validation.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"Waiting for active validation in {artifacts}", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        run_validation(args, artifacts)
+
+
+def run_validation(args: argparse.Namespace, artifacts: Path) -> None:
+    """Publish the complete run while holding exclusive use of its evidence directory."""
+    results = []
+    write_summary(artifacts, results, "running")
+    try:
+        validate(args, artifacts, results)
+    except BaseException as error:
+        interrupted = isinstance(error, KeyboardInterrupt) or (
+            isinstance(error, SystemExit) and error.code == 128 + signal.SIGTERM)
+        exit_code = 130 if isinstance(error, KeyboardInterrupt) else 1
+        if isinstance(error, SystemExit) and isinstance(error.code, int):
+            exit_code = error.code
+        write_summary(artifacts, results, "interrupted" if interrupted else "failed",
+                      str(error) or type(error).__name__, exit_code)
+        raise
+    write_summary(artifacts, results, "passed")
+    print(f"All {len(results)} selected validation steps passed. Evidence: {artifacts}")
+
+
+def validate(args: argparse.Namespace, artifacts: Path, results: list) -> None:
+    """Run SDK preflight and the configured package checks with current-run evidence."""
     environment = os.environ.copy()
     environment["CLANG_MODULE_CACHE_PATH"] = str(artifacts / "clang-cache")
     environment["SWIFTPM_MODULECACHE_OVERRIDE"] = str(artifacts / "swift-cache")
     environment["NSUnbufferedIO"] = "YES"
     cache = ["--cache-path", str(artifacts / "spm-cache"), "--disable-sandbox"]
-    results = []
     sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
     if int(sdk.split(".")[0]) < 27:
         raise SystemExit("An Xcode 27 SDK is required; select a supported Xcode before validation.")
@@ -112,8 +149,7 @@ def main() -> None:
         run_step("documentation-archive", [sys.executable, "-m", "zipfile", "-c",
                  str(artifacts / "AdaptiveModelRouting.doccarchive.zip"),
                  str(artifacts / "AdaptiveModelRouting.doccarchive")], artifacts, environment, results)
-    print(f"All {len(results)} selected validation steps passed. Evidence: {artifacts}")
-
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     main()

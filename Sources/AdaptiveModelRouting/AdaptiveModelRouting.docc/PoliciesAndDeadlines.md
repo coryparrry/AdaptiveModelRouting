@@ -12,6 +12,8 @@ Apply hard provider constraints independently of timing preferences.
 
 Presets tune latency policy and never override these constraints. `.qualityFirst` expresses a stronger cloud preference; it does not evaluate generated quality. If local quality is unacceptable for a task, use `.cloudRequired`.
 
+When a provider fails and its fallback loses eligibility before dispatch, the caller receives the original provider error. Cancelling a background calibration call also preserves that error if the request later needs the cancelled call for recovery. A cloud provider that runs and returns nil continues to report unavailability.
+
 ## One request budget
 
 All router requests default to a 60-second deadline spanning token counting, generation and recovery. Configure a default or override one call:

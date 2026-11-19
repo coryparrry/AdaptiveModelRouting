@@ -27,6 +27,7 @@ public enum DemoPolicy: String, CaseIterable, Identifiable, Sendable {
 
 /// Lets the sample select presets without duplicating their tuning values.
 public enum DemoPreset: String, CaseIterable, Identifiable, Sendable {
+    case fastest = "Fastest"
     case balanced = "Balanced"
     case quality = "Quality first"
     case latency = "Latency first"
@@ -34,6 +35,7 @@ public enum DemoPreset: String, CaseIterable, Identifiable, Sendable {
     /// Uses the package's validated default configuration for each choice.
     var value: RoutingConfiguration {
         switch self {
+        case .fastest: .fastest
         case .balanced: .balanced
         case .quality: .qualityFirst
         case .latency: .latencyFirst
@@ -58,51 +60,106 @@ public struct DemoAttempt: Identifiable, Sendable {
     public let duration: String
 }
 
+/// Keeps disk opt-in independent for simulated and Apple workloads.
+private struct DemoStoragePreferences: Codable {
+    var simulated = false
+    var apple = false
+
+    /// Reads and updates the explicit choice for exactly one provider mode.
+    subscript(mode: DemoMode) -> Bool {
+        get { mode == .simulated ? simulated : apple }
+        set {
+            switch mode {
+            case .simulated: simulated = newValue
+            case .apple: apple = newValue
+            }
+        }
+    }
+}
+
+/// Keeps a provider's adapter and its calibration state together.
+@MainActor
+private enum DemoRoutingOwner {
+    case simulated(AdaptiveRouter)
+    case apple(FoundationModelsRouter)
+
+    /// Provides the same storage and calibration controls for either provider.
+    var router: AdaptiveRouter {
+        switch self {
+        case .simulated(let router): router
+        case .apple(let adapter): adapter.router
+        }
+    }
+}
+
 /// Owns the sample's routing flow and guards observable state against late cancelled-task completion.
 @MainActor
 @Observable
 public final class DemoModel {
     public var prompt = "Summarize the trade-offs between local and cloud models."
-    public var mode: DemoMode = .simulated
+    public var mode: DemoMode = .simulated {
+        willSet { if mode != newValue { leaveMode() } }
+        didSet { if mode != oldValue { enterMode() } }
+    }
     public var policy: DemoPolicy = .local
-    public var preset: DemoPreset = .balanced
+    public var preset: DemoPreset = .fastest {
+        didSet {
+            guard preset != oldValue else { return }
+            cancel()
+            activeRouter.updateSelectionThresholds(from: preset.value)
+        }
+    }
     public var fault: DemoFault = .none
     public var deadlineSeconds = 5.0
-    public private(set) var persistCalibration = false
+    public var persistCalibration: Bool { storagePreferences[mode] }
     public private(set) var output = ""
     public private(set) var status = "Ready"
     public private(set) var isRunning = false
+    /// The foreground request and its remaining optional calibration can each be cancelled.
+    public var canCancel: Bool { isRunning || calibrationTask != nil }
     public private(set) var errorMessage: String?
     public private(set) var selectionReason = "No request yet"
     public private(set) var attempts: [DemoAttempt] = []
     public private(set) var sampleCount = 0
     public private(set) var storageLabel = "In memory"
+    private var calibrationTask: Task<Void, Never>?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
-    @ObservationIgnored private var appliedKey = ""
+    @ObservationIgnored private var visibleWindows = Set<UUID>()
     @ObservationIgnored private let cacheRoot: URL
-    @ObservationIgnored private var core: AdaptiveRouter
-    @ObservationIgnored private var apple: FoundationModelsRouter?
+    private var storagePreferences = DemoStoragePreferences()
+    @ObservationIgnored private lazy var simulatedOwner = makeOwner(for: .simulated)
+    @ObservationIgnored private lazy var appleOwner = makeOwner(for: .apple)
+    private var owner: DemoRoutingOwner {
+        switch mode {
+        case .simulated: simulatedOwner
+        case .apple: appleOwner
+        }
+    }
+    var activeRouter: AdaptiveRouter { owner.router }
 
-    /// Starts with memory-only fixture routing and no Apple model instances or network observation.
+    /// Starts with fixture routing and restores only the user's explicit calibration-storage preference.
     public init(cacheRoot: URL = URL.applicationSupportDirectory.appendingPathComponent("AdaptiveModelRoutingDemo")) {
         self.cacheRoot = cacheRoot
-        core = AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false, persistence: .memoryOnly)
+        // A legacy global Boolean cannot establish permission for either individual mode.
+        if let data = try? Data(contentsOf: cacheRoot.appendingPathComponent("storage-preference.json")),
+           let preferences = try? JSONDecoder().decode(DemoStoragePreferences.self, from: data) {
+            storagePreferences = preferences
+        }
+        refreshProfile()
     }
 
     /// Runs one streaming request; a generation token prevents an old task from overwriting a later run.
     public func start() {
         guard !isRunning, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        configure()
         generation += 1
         let token = generation
         let prompt = prompt
-        let selectedMode = mode
+        let requestOwner = owner
         let policy = policy.value
         let fault = fault
-        output = ""
-        attempts = []
-        errorMessage = nil
+        let deadline = RoutingDeadline.after(.seconds(max(0.001, deadlineSeconds)))
+        clearDisplayedRequest()
         status = "Generating…"
         isRunning = true
         let observer: (RoutingAttempt) -> Void = { [weak self] attempt in
@@ -111,17 +168,23 @@ public final class DemoModel {
                 duration: String(format: "%.3f s", attempt.seconds)))
         }
         task = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, self.generation == token, !Task.isCancelled else { return }
             defer {
-                if self.generation == token { self.isRunning = false; self.task = nil; self.refreshProfile() }
+                if self.generation == token {
+                    self.isRunning = false
+                    self.task = nil
+                    self.refreshProfile()
+                    self.observeRemainingCalibration()
+                }
             }
             do {
                 let stream: AsyncThrowingStream<RoutingStreamEvent<String>, any Error>
-                if selectedMode == .apple, let apple = self.apple {
-                    stream = apple.stream(to: prompt, policy: policy, onAttempt: observer)
-                } else {
-                    stream = self.core.stream(inputTokens: max(1, (prompt.utf8.count + 3) / 4), localContextCapacity: 8_192,
-                        policy: policy, workload: .init(expectedOutputTokens: 256), onAttempt: observer,
+                switch requestOwner {
+                case .apple(let apple):
+                    stream = apple.stream(to: prompt, policy: policy, deadline: deadline, onAttempt: observer)
+                case .simulated(let core):
+                    stream = core.stream(inputTokens: max(1, (prompt.utf8.count + 3) / 4), localContextCapacity: 8_192,
+                        policy: policy, workload: .init(expectedOutputTokens: 256), deadline: deadline, onAttempt: observer,
                         cloud: { self.fixtureStream(route: .cloud, fault: fault) },
                         onDevice: { self.fixtureStream(route: .onDevice, fault: .none) })
                 }
@@ -152,15 +215,27 @@ public final class DemoModel {
         }
     }
 
-    /// Cancels immediately while preserving any partial output for inspection.
+    /// Registers one visible view sharing this demo session.
+    public func windowAppeared(_ id: UUID) { visibleWindows.insert(id) }
+
+    /// Stops foreground and calibration work once the last view leaves the shared session.
+    public func windowDisappeared(_ id: UUID) {
+        guard visibleWindows.remove(id) != nil, visibleWindows.isEmpty else { return }
+        cancel()
+    }
+
+    /// Cancels ongoing foreground or calibration work while preserving displayed output.
     public func cancel() {
+        calibrationTask?.cancel()
+        calibrationTask = nil
+        activeRouter.cancelCalibration()
+        refreshProfile()
         guard isRunning else { return }
         generation += 1
         task?.cancel()
         task = nil
         isRunning = false
         status = "Cancelled"
-        refreshProfile()
     }
 
     /// Supports deterministic model-level smoke tests without opening a window or invoking Apple models.
@@ -169,7 +244,6 @@ public final class DemoModel {
     /// Resets only the selected demo mode's calibration and reports filesystem failures.
     public func resetProfile() {
         guard !isRunning else { return }
-        configure()
         do { try activeRouter.resetProfile(); status = "Calibration reset"; errorMessage = nil }
         catch { errorMessage = error.localizedDescription }
         refreshProfile()
@@ -178,34 +252,81 @@ public final class DemoModel {
     /// Applies an explicit storage choice to the selected workload and clears its file when disabling disk.
     public func setPersistence(_ enabled: Bool) {
         guard !isRunning else { return }
-        configure()
         do {
+            var updated = storagePreferences
+            updated[mode] = enabled
+            try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(updated)
+            try data.write(to: cacheRoot.appendingPathComponent("storage-preference.json"), options: .atomic)
+            storagePreferences = updated
             try activeRouter.setPersistence(enabled ? .disk : .memoryOnly)
-            persistCalibration = enabled
             errorMessage = nil
-        } catch { errorMessage = error.localizedDescription }
-        refreshProfile()
-    }
-
-    /// Keeps the router alive while its workload settings remain stable.
-    private func configure() {
-        let key = "\(mode.rawValue)|\(preset.rawValue)|\(deadlineSeconds)"
-        guard key != appliedKey else { return }
-        appliedKey = key
-        let configuration = RoutingConfiguration(customizing: preset.value,
-            requestDeadline: .after(.seconds(max(0.001, deadlineSeconds))))
-        if mode == .apple {
-            apple = FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.", configuration: configuration,
-                options: .init(maximumResponseTokens: 256), cacheRoot: cacheRoot.appendingPathComponent("apple"),
-                persistence: persistCalibration ? .disk : .memoryOnly)
-        } else {
-            core = AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false,
-                configuration: configuration, persistence: persistCalibration ? .disk : .memoryOnly, calibrationIdentifier: "simulated-v1")
+        } catch {
+            // Honor an opt-out for this session even if preference persistence or file removal failed.
+            if !enabled {
+                storagePreferences[mode] = false
+                try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
+            }
+            errorMessage = error.localizedDescription
         }
         refreshProfile()
     }
 
-    private var activeRouter: AdaptiveRouter { mode == .apple ? (apple?.router ?? core) : core }
+    /// Stops the outgoing mode's work and disk writes while keeping its in-memory state.
+    private func leaveMode() {
+        cancel()
+        if activeRouter.persistence == .disk {
+            try? activeRouter.setPersistence(.memoryOnly, clearExistingCache: false)
+        }
+    }
+
+    /// Applies the current preset and resumes the returning mode's opted-in disk cache.
+    private func enterMode() {
+        clearDisplayedRequest()
+        status = "Ready"
+        activeRouter.updateSelectionThresholds(from: preset.value)
+        if persistCalibration && activeRouter.persistence == .memoryOnly {
+            do { try activeRouter.setPersistence(.disk) }
+            catch { errorMessage = error.localizedDescription }
+        }
+        refreshProfile()
+    }
+
+    /// Clears the previous response and its diagnostics before the next provider or request is shown.
+    private func clearDisplayedRequest() {
+        output = ""
+        attempts = []
+        errorMessage = nil
+        selectionReason = "No request yet"
+    }
+
+    /// Opens a workload on first use with its own persisted storage choice.
+    private func makeOwner(for mode: DemoMode) -> DemoRoutingOwner {
+        let configuration = preset.value
+        let persistence: RoutingPersistence = storagePreferences[mode] ? .disk : .memoryOnly
+        switch mode {
+        case .apple:
+            return .apple(FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.",
+                configuration: configuration, options: .init(maximumResponseTokens: 256),
+                cacheRoot: cacheRoot.appendingPathComponent("apple"), persistence: persistence))
+        case .simulated:
+            return .simulated(AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false,
+                configuration: configuration, persistence: persistence, calibrationIdentifier: "simulated-v1"))
+        }
+    }
+
+    /// Keeps Cancel available until the optional inference finishes, then displays its timing.
+    private func observeRemainingCalibration() {
+        calibrationTask?.cancel()
+        let router = activeRouter
+        guard router.isCalibrating else { calibrationTask = nil; return }
+        calibrationTask = Task { @MainActor [weak self] in
+            await router.waitForCalibration()
+            guard !Task.isCancelled, let self else { return }
+            self.refreshProfile()
+            self.calibrationTask = nil
+        }
+    }
 
     /// Updates presentation fields after controls or requests change calibration.
     private func refreshProfile() {
@@ -259,6 +380,7 @@ public final class DemoModel {
         case .cloudRefresh: "Checking cloud speed again"
         case .localUnavailable: "Local model not ready"
         case .cloudUnavailable: "Cloud model not ready"
+        case .cloudQuotaConserved: "Preserving cloud quota"
         case .localContextExceeded: "Input exceeds local context"
         case .noAvailableProvider: "No model is ready"
         }

@@ -17,7 +17,17 @@ public nonisolated enum InferenceRoute: String, Codable, Sendable {
     }
 }
 
-/// Tunes the cloud-quality preference and context reservation for a particular workload.
+/// Controls whether calibration can run both inference providers for the same request.
+public nonisolated enum RoutingCalibration: Sendable, Equatable {
+    /// Runs the other provider during initial learning and every N eligible requests thereafter (one by default).
+    /// Local rechecks use device compute; optional cloud calls also obey cloudRetryInterval.
+    /// Probe results train timings without replacing the selected provider's answer.
+    case paired(refreshEvery: Int = 1, timeout: Duration = .seconds(60))
+    /// Learns from one selected provider at a time, including occasional local exploration.
+    case singleProvider
+}
+
+/// Tunes latency selection, ongoing calibration and context reservation for a workload.
 public nonisolated struct RoutingConfiguration: Sendable {
     /// Tokens reserved for local response generation and prompt framing.
     public let localResponseReserve: Int
@@ -35,7 +45,7 @@ public nonisolated struct RoutingConfiguration: Sendable {
     public let sizeTolerance: Double
     /// Duration of provider-health backoff after a recoverable failure.
     public let failureBackoff: TimeInterval
-    /// Interval before probing cloud again when local inference usually wins.
+    /// Minimum time since any cloud use before optional cloud calibration or single-provider refresh.
     public let cloudRetryInterval: TimeInterval
     /// Interval before refreshing local calibration when cloud usually wins.
     public let localRefreshInterval: TimeInterval
@@ -45,9 +55,21 @@ public nonisolated struct RoutingConfiguration: Sendable {
     public let variabilityAllowance: Double
     /// Bounds preflight, generation and recovery together; unlimited must be selected explicitly.
     public let requestDeadline: RoutingDeadline
+    /// Paired calibration is automatic by default; use singleProvider for operations with side effects.
+    public let calibration: RoutingCalibration
+    /// Protects remaining cloud quota by excluding approaching-limit cloud from automatic requests.
+    /// Explicit cloudRequired requests may still use approaching quota, but never exhausted quota.
+    /// Also confirms mixed paired evidence before a zero-margin paid promotion.
+    public let conserveCloudQuota: Bool
+    /// Halves the weight of older measurements across this elapsed interval, in addition to recency rank.
+    public let predictionHalfLife: TimeInterval
 
-    /// Preserves the original cloud-first policy and one-deviation timing allowance.
-    public static var balanced: Self { .init() }
+    /// Chooses the lowest weighted latency after calibration, without margins or variability penalties.
+    public static var fastest: Self { .init() }
+    /// Opts into a 350 ms/25% local saving requirement and a one-deviation cloud preference.
+    public static var balanced: Self {
+        .init(minimumLocalSavingSeconds: 0.35, minimumLocalSavingFraction: 0.25, variabilityAllowance: 1)
+    }
     /// Requires more observations and a larger local advantage before departing from cloud preference.
     public static var qualityFirst: Self {
         .init(minimumLocalSavingSeconds: 0.75, minimumLocalSavingFraction: 0.4,
@@ -61,13 +83,15 @@ public nonisolated struct RoutingConfiguration: Sendable {
     /// Creates a policy; reserves and margins must be nonnegative, and the slow limit positive.
     public init(
         localResponseReserve: Int = 400,
-        minimumLocalSavingSeconds: TimeInterval = 0.35,
-        minimumLocalSavingFraction: Double = 0.25,
+        minimumLocalSavingSeconds: TimeInterval = 0,
+        minimumLocalSavingFraction: Double = 0,
         slowCloudAfter: Duration = .seconds(20),
         minimumSamples: Int = 3, predictionSampleLimit: Int = 6, sizeTolerance: Double = 0.25,
         failureBackoff: TimeInterval = 60, cloudRetryInterval: TimeInterval = 600,
         localRefreshInterval: TimeInterval = 1_800, sampleLifetime: TimeInterval = 7 * 86_400,
-        variabilityAllowance: Double = 1, requestDeadline: RoutingDeadline = .after(.seconds(60))
+        variabilityAllowance: Double = 0, requestDeadline: RoutingDeadline = .after(.seconds(60)),
+        calibration: RoutingCalibration = .paired(), conserveCloudQuota: Bool = true,
+        predictionHalfLife: TimeInterval = 300
     ) {
         precondition(localResponseReserve >= 0)
         precondition(minimumLocalSavingSeconds.isFinite && minimumLocalSavingSeconds >= 0)
@@ -79,7 +103,11 @@ public nonisolated struct RoutingConfiguration: Sendable {
             precondition(interval.isFinite && interval > 0)
         }
         precondition(variabilityAllowance.isFinite && variabilityAllowance >= 0)
+        precondition(predictionHalfLife.isFinite && predictionHalfLife > 0)
         if case .after(let duration) = requestDeadline { precondition(duration > .zero) }
+        if case .paired(let frequency, let timeout) = calibration {
+            precondition(frequency > 0 && timeout > .zero)
+        }
         self.localResponseReserve = localResponseReserve
         self.minimumLocalSavingSeconds = minimumLocalSavingSeconds
         self.minimumLocalSavingFraction = minimumLocalSavingFraction
@@ -93,6 +121,9 @@ public nonisolated struct RoutingConfiguration: Sendable {
         self.sampleLifetime = sampleLifetime
         self.variabilityAllowance = variabilityAllowance
         self.requestDeadline = requestDeadline
+        self.calibration = calibration
+        self.conserveCloudQuota = conserveCloudQuota
+        self.predictionHalfLife = predictionHalfLife
     }
 
     /// Overrides selected preset values while retaining validation and all unspecified settings.
@@ -103,7 +134,8 @@ public nonisolated struct RoutingConfiguration: Sendable {
         sizeTolerance: Double? = nil, failureBackoff: TimeInterval? = nil,
         cloudRetryInterval: TimeInterval? = nil, localRefreshInterval: TimeInterval? = nil,
         sampleLifetime: TimeInterval? = nil, variabilityAllowance: Double? = nil,
-        requestDeadline: RoutingDeadline? = nil
+        requestDeadline: RoutingDeadline? = nil, calibration: RoutingCalibration? = nil,
+        conserveCloudQuota: Bool? = nil, predictionHalfLife: TimeInterval? = nil
     ) {
         self.init(localResponseReserve: localResponseReserve ?? preset.localResponseReserve,
             minimumLocalSavingSeconds: minimumLocalSavingSeconds ?? preset.minimumLocalSavingSeconds,
@@ -117,6 +149,9 @@ public nonisolated struct RoutingConfiguration: Sendable {
             localRefreshInterval: localRefreshInterval ?? preset.localRefreshInterval,
             sampleLifetime: sampleLifetime ?? preset.sampleLifetime,
             variabilityAllowance: variabilityAllowance ?? preset.variabilityAllowance,
-            requestDeadline: requestDeadline ?? preset.requestDeadline)
+            requestDeadline: requestDeadline ?? preset.requestDeadline,
+            calibration: calibration ?? preset.calibration,
+            conserveCloudQuota: conserveCloudQuota ?? preset.conserveCloudQuota,
+            predictionHalfLife: predictionHalfLife ?? preset.predictionHalfLife)
     }
 }

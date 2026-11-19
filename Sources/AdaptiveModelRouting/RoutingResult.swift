@@ -1,15 +1,40 @@
 import Foundation
 
+/// A provider's quota signal; unknown means no quota information was supplied by a custom provider.
+public nonisolated enum CloudQuotaStatus: String, Sendable, Equatable {
+    case unknown, available, approachingLimit, exhausted
+
+    /// Identifies quota signals that rule out a foreground cloud call under the chosen policy.
+    func blocksCloud(for policy: RoutingPolicy, conserveQuota: Bool) -> Bool {
+        self == .exhausted || (self == .approachingLimit && policy == .automatic && conserveQuota)
+    }
+}
+
 /// Provider readiness supplied by an adapter or app without recording identity or model content.
 public nonisolated struct RoutingAvailability: Equatable, Sendable {
     public let onDevice: Bool
     public let cloud: Bool
+    public let cloudQuota: CloudQuotaStatus
 
     /// Defaults to callable providers for compatibility with the closure-based API.
-    public init(onDevice: Bool = true, cloud: Bool = true) {
+    public init(onDevice: Bool = true, cloud: Bool = true, cloudQuota: CloudQuotaStatus = .unknown) {
         self.onDevice = onDevice
         self.cloud = cloud
+        self.cloudQuota = cloudQuota
     }
+
+    /// Treats quota conservation as provider eligibility, without adding a hidden latency preference.
+    func restricted(to policy: RoutingPolicy, conserveQuota: Bool) -> Self {
+        .init(onDevice: onDevice && policy != .cloudRequired,
+            cloud: cloud && policy != .localOnly && !cloudQuota.blocksCloud(for: policy, conserveQuota: conserveQuota),
+            cloudQuota: cloudQuota)
+    }
+
+    /// Indicates provider-wide quota pressure, including signals supplied with a local-only request.
+    var hasCloudQuotaPressure: Bool { cloudQuota == .approachingLimit || cloudQuota == .exhausted }
+
+    /// Optional calibration never consumes a provider's remaining near-limit quota.
+    var permitsCloudCalibration: Bool { cloud && !hasCloudQuotaPressure }
 }
 
 /// A weighted latency prediction and its recent variability, expressed in seconds.
@@ -24,6 +49,7 @@ public nonisolated enum RoutingReason: String, Sendable {
     case cloudRequired, localOnly, cloudPreferred, localCalibration, localFaster, offline
     case cloudBackoff, localBackoff, insufficientEvidence, cloudRefresh
     case localUnavailable, cloudUnavailable, localContextExceeded, noAvailableProvider
+    case cloudQuotaConserved
 }
 
 /// Describes the original selection; the result's actual route may differ after recovery.

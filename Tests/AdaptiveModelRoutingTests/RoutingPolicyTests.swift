@@ -12,7 +12,7 @@ final class RoutingPolicyTests: XCTestCase {
     func testCloudRequiredNeverRunsLocal() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for _ in 0..<4 {
             let result: String? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
                 policy: .cloudRequired, cloud: { "cloud" },
@@ -44,7 +44,7 @@ final class RoutingPolicyTests: XCTestCase {
     func testPermanentErrorsDoNotFallbackOrPoisonHealth() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         for failure in [ProviderError.refusal, .invalidInput, .quota] {
             do {
                 let _: Int? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
@@ -62,7 +62,7 @@ final class RoutingPolicyTests: XCTestCase {
     func testCustomQuotaRecoveryIsClassifiedOnce() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         var classifications = 0
         let result: String? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
             shouldFallback: { route, error in
@@ -80,7 +80,7 @@ final class RoutingPolicyTests: XCTestCase {
     func testCustomPolicyCanRejectFallback() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+        let router = singleProviderRouter(directory: directory, monitorConnection: false)
         do {
             let _: Int? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
                 shouldFallback: { _, _ in false }, cloud: { throw URLError(.timedOut) },
@@ -96,7 +96,7 @@ final class RoutingPolicyTests: XCTestCase {
         for offline in [false, true] {
             let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
-            let router = AdaptiveRouter(directory: directory, monitorConnection: false)
+            let router = singleProviderRouter(directory: directory, monitorConnection: false)
             if offline { router.updateConnection(.init(kind: .offline)) }
             var routes: [InferenceRoute] = []
             do {
@@ -153,7 +153,7 @@ final class RoutingPolicyTests: XCTestCase {
     func testSlowPermanentErrorRetainsLatencyBackoff() async throws {
         let directory = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let router = AdaptiveRouter(directory: directory, monitorConnection: false,
+        let router = singleProviderRouter(directory: directory, monitorConnection: false,
             configuration: .init(slowCloudAfter: .milliseconds(5)))
         do {
             let _: Int? = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,

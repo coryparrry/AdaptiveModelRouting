@@ -30,16 +30,21 @@ final class RoutingRequestContext {
     private var termination: (any Error)?
     private var attempt: (route: InferenceRoute, started: ContinuousClock.Instant)?
     private let observer: ((RoutingAttempt) -> Void)?
+    private let now: () -> ContinuousClock.Instant
     private(set) var attempts: [RoutingAttempt] = []
+    var onAbort: (() -> Void)?
+    var onWorkerFinished: (() -> Void)?
 
     /// Resolves a positive monotonic deadline before preflight starts.
-    init(deadline: RoutingDeadline, observer: ((RoutingAttempt) -> Void)?) throws {
+    init(deadline: RoutingDeadline, now: @escaping () -> ContinuousClock.Instant = { .now },
+        observer: ((RoutingAttempt) -> Void)?) throws {
         switch deadline {
         case .after(let duration):
             guard duration > .zero else { throw RoutingRequestError.invalidDeadline }
-            cutoff = .now.advanced(by: duration)
+            cutoff = now().advanced(by: duration)
         case .unlimited: cutoff = nil
         }
+        self.now = now
         self.observer = observer
     }
 
@@ -47,15 +52,24 @@ final class RoutingRequestContext {
     func checkActive() throws {
         try Task.checkCancellation()
         if let termination { throw termination }
-        if let cutoff, ContinuousClock.now >= cutoff { throw RoutingRequestError.deadlineExceeded }
+        if let cutoff, now() >= cutoff { throw RoutingRequestError.deadlineExceeded }
         guard active else { throw CancellationError() }
+    }
+
+    /// Gives elapsed deadlines and caller cancellation precedence when a provider throws before the timer runs.
+    func effectiveError(_ providerError: any Error) -> any Error {
+        do { try checkActive(); return providerError }
+        catch { return error }
     }
 
     /// Starts timing only an inference operation, not tokenization or unavailable-provider checks.
     func begin(_ route: InferenceRoute) throws {
         try checkActive()
-        attempt = (route, .now)
+        attempt = (route, now())
     }
+
+    /// Drops a fallback wait when its optional worker declined before invoking any provider.
+    func discardUndispatchedAttempt() { attempt = nil }
 
     /// Publishes one outcome while suppressing callbacks from abandoned operations.
     func finishAttempt(_ outcome: RoutingAttempt.Outcome) {
@@ -72,14 +86,22 @@ final class RoutingRequestContext {
         termination = error
         finishAttempt((error as? RoutingRequestError) == .deadlineExceeded ? .timedOut : .cancelled)
         active = false
+        onAbort?()
+        onAbort = nil
     }
 
     /// Closes a completed request without changing its already-reported attempt outcomes.
-    func complete() { active = false }
+    func complete() { active = false; onAbort = nil }
+
+    /// Releases execution ownership only after the provider worker actually exits.
+    func workerFinished() {
+        onWorkerFinished?()
+        onWorkerFinished = nil
+    }
 
     /// Converts monotonic elapsed time into diagnostic seconds.
     private func seconds(since start: ContinuousClock.Instant) -> Double {
-        let components = start.duration(to: .now).components
+        let components = start.duration(to: now()).components
         return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }
@@ -140,17 +162,19 @@ private final class RoutingRequestGate<Value> {
     func start(_ continuation: CheckedContinuation<RoutingActorValue<Value>, any Error>,
         operation: @escaping @MainActor () async throws -> Value) {
         guard !resolved else {
+            context.workerFinished()
             continuation.resume(throwing: terminalError ?? CancellationError())
             return
         }
         self.continuation = continuation
         let worker = Task { @MainActor in
+            defer { context.workerFinished() }
             do {
                 try context.checkActive()
                 let value = try await operation()
                 try context.checkActive()
                 succeed(value)
-            } catch { fail(error) }
+            } catch { fail(context.effectiveError(error)) }
         }
         self.worker = worker
         cancellation.register(worker)
