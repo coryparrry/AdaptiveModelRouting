@@ -14,6 +14,32 @@ final class CostSafetyMatrixTests: XCTestCase {
     /// The compatibility bare-stream entry point preserves every dispatch policy and budget too.
     func testLegacyStreamingDispatchMatrix() async throws { try await runMatrix(streaming: true, legacy: true) }
 
+    /// A cancelled worker can outlive its result, then free the slot during matrix cleanup.
+    func testMatrixCleanupWaitsForCancelledWorkerExit() async throws {
+        let router = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+        let worker = ControlledRoutingProvider()
+        defer { worker.release(); router.cancelCalibration() }
+        _ = try await router.respond(inputTokens: 100, localContextCapacity: 8_192,
+            cloud: { await worker.started.wait(); return "cloud" }, onDevice: { await worker.call() })
+        router.cancelCalibration()
+        await router.waitForCalibration()
+        let releasedWhileBlocked = try await waitForSlotRelease(router, timeout: .milliseconds(5))
+        XCTAssertFalse(releasedWhileBlocked, "Cleanup must report a worker that stays occupied past its budget.")
+        Task { worker.release() }
+        let released = try await waitForSlotRelease(router)
+        XCTAssertTrue(released, "A worker exiting during cleanup must count as released.")
+    }
+
+    /// Allows a cancelled fixture to unwind before reading final counts, with a deadline for a stuck worker.
+    private func waitForSlotRelease(_ router: AdaptiveRouter, timeout: Duration = .seconds(2)) async throws -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while router.isCalibrating {
+            guard ContinuousClock.now < deadline else { return false }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        return true
+    }
+
     /// Collects failures by scenario so one mismatch cannot hide untested remaining combinations.
     private func runMatrix(streaming: Bool, legacy: Bool = false) async throws {
         let profiles = try CostProfiles()
@@ -61,6 +87,7 @@ final class CostSafetyMatrixTests: XCTestCase {
                 if let route = completed?.route { actual = "value.\(route.rawValue)" }
             } catch { actual = costError(error) }
             await router.waitForCalibration()
+            let slotReleased = try await waitForSlotRelease(router)
             let cloud = calls.started[.cloud, default: 0]
             let local = calls.started[.onDevice, default: 0]
             cloudStarts += cloud
@@ -85,7 +112,7 @@ final class CostSafetyMatrixTests: XCTestCase {
                 if result.attempts.count > 2 { violations.append("More than two foreground attempts") }
                 if result.value != nil && result.value != result.route?.rawValue { violations.append("Output provider differs from reported route") }
             }
-            if router.isCalibrating { violations.append("Completed synthetic provider left its slot occupied") }
+            if !slotReleased { violations.append("Completed synthetic provider left its slot occupied") }
             if !violations.isEmpty {
                 failures.append(["index": index, "scenario": scenario.label, "violations": violations,
                     "cloudStarts": cloud, "localStarts": local])

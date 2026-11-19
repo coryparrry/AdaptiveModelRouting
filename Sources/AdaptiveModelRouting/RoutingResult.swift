@@ -3,6 +3,11 @@ import Foundation
 /// A provider's quota signal; unknown means no quota information was supplied by a custom provider.
 public nonisolated enum CloudQuotaStatus: String, Sendable, Equatable {
     case unknown, available, approachingLimit, exhausted
+
+    /// Identifies quota signals that rule out a foreground cloud call under the chosen policy.
+    func blocksCloud(for policy: RoutingPolicy, conserveQuota: Bool) -> Bool {
+        self == .exhausted || (self == .approachingLimit && policy == .automatic && conserveQuota)
+    }
 }
 
 /// Provider readiness supplied by an adapter or app without recording identity or model content.
@@ -21,8 +26,7 @@ public nonisolated struct RoutingAvailability: Equatable, Sendable {
     /// Treats quota conservation as provider eligibility, without adding a hidden latency preference.
     func restricted(to policy: RoutingPolicy, conserveQuota: Bool) -> Self {
         .init(onDevice: onDevice && policy != .cloudRequired,
-            cloud: cloud && policy != .localOnly && cloudQuota != .exhausted
-                && !(conserveQuota && policy == .automatic && cloudQuota == .approachingLimit),
+            cloud: cloud && policy != .localOnly && !cloudQuota.blocksCloud(for: policy, conserveQuota: conserveQuota),
             cloudQuota: cloudQuota)
     }
 

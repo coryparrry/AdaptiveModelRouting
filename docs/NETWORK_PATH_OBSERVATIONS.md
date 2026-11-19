@@ -1,30 +1,40 @@
 # Network observations and cloud timing history
 
-The native monitor can deliver another callback without a different native path. Previously every accepted callback called `updateConnection`, cancelled optional calibration, removed matching cloud timings and advanced the request generation. That could restart cloud learning or discard an in-flight observation even though the path was equal.
+The router learns cloud response times for each connection. On an unequal native path, it advances the connection generation, cancels optional calibration and discards late cloud measurements from the old generation. Whether it also clears the destination connection's saved cloud timings depends on what changed.
 
-Native delivery now checks `NWPath` equality before invalidating history. Equal native paths preserve samples, generation and calibration ownership. They still advance the observation timestamp so an older queued callback cannot replace newer state. Unequal native paths retain invalidation behavior, including transitions with identical coarse Wi-Fi/cost flags.
+| Observation | Effect on saved cloud timings |
+|---|---|
+| Equal native path | Keeps timings, generation and active calibration. The observation timestamp still advances. |
+| First transition from an unknown connection | Keeps saved timings so a new router can use its existing history. |
+| Unequal native path with only a link-quality change or no observable difference | Keeps timings as prior evidence while the router gathers fresh measurements. |
+| Change in connection type, cost, or another observable route property | Clears cloud timings for the destination connection. |
+| Explicit `updateConnection` from a known connection | Clears cloud timings for the supplied connection, even when its coarse flags match. |
 
-Explicit `updateConnection` calls remain change notifications: accepted calls intentionally invalidate matching cloud history. They clear the native comparison baseline so the next native delivery restores the monitor's state. Stale manual or native observations do not change that baseline.
+The router ignores out-of-order observations. An accepted manual update clears the native comparison baseline. Local model timings survive connection changes.
 
-## Live evidence
+## Historical qualification
+
+The following trials describe successive implementations. The [retained-history fix](#retained-history-fix-and-completed-actual-app-rerun-13-november) introduced the current handling of unexplained path changes.
+
+### Early native path observations
 
 The real short-output trials reproduced callbacks where native path equality was true while the reported link-quality comparison changed. The router retained its three cloud samples and did not advance generation. This is a concrete callback class that the previous unconditional handler would have invalidated.
 
-The trials also observed unequal native paths whose compared public properties and coarse Wi-Fi flags were unchanged. Those updates continue to invalidate cloud history. The comparison flags are diagnostic, not a substitute for the SDK's native equality operation. They cannot identify every native-state difference or retroactively establish the cause of the earlier long run's notifications.
+The trials also observed unequal native paths whose compared public properties and coarse Wi-Fi flags were unchanged. The implementation under test cleared cloud history on those updates. The flags could not identify the underlying state change or establish the cause of the earlier long run's notifications.
 
 The installed macOS 27.3 SDK's `Network.framework/Headers/path.h` documents native path equality as a comparison of path content and treats unequal objects as different network states. The Swift interface exposes `NWPath` equality separately from its individual properties; it does not expose an explanation for every inequality. The observed all-false public comparison flags therefore do not prove a false notification, identify a physical handoff, or justify suppressing that transition. The exact underlying cause of those opaque inequalities remains unverified.
 
-The diagnostic compares properties against the retained native baseline; that baseline is replaced by an applied native transition, not every duplicate callback.
+The current router compares properties with the last accepted native path. An equal callback refreshes that baseline while preserving the connection generation and timing history.
 
-## Privacy and overhead
+### Privacy and overhead in the early trials
 
 The last native path is held only in memory. The optional internal qualification hook emits a disposition, generation numbers, coarse connection values and change booleans. It never emits interface identifiers, gateway addresses, endpoints, SSIDs or native debug descriptions. The disk-cache schema is unchanged.
 
-Ordinary consumers have no built-in telemetry enabled. When no diagnostic hook is attached, the additional property comparisons are skipped; only native path equality is needed to admit a callback. Equal notifications also avoid unnecessary cache writes.
+The early implementation compared individual properties only when the diagnostic hook was attached. The current router also uses those comparisons to decide whether to retain cloud timings. Equal notifications avoid unnecessary cache writes.
 
-## Quota-paced revalidation and foreground learning
+### Early quota-paced revalidation and foreground learning
 
-Unequal native paths still invalidate matching cloud timings, cancel optional probes and advance generation. Opaque inequalities are not silently ignored. Paired mode keeps qualified local foreground inference while cloud evidence is missing or its latest comparable observation is slower. Optional probes retain the persisted 600-second default cloud-use cooldown.
+At this stage, unequal native paths cleared matching cloud timings, cancelled optional probes and advanced generation. Paired mode kept qualified local foreground inference while cloud evidence was missing or its latest comparable observation was slower. Optional probes respected the persisted 600-second default cloud-use cooldown.
 
 A later real PCC-faster experiment exposed a limitation of requiring three separately paced probes: a native inequality discarded two successful observations before the set qualified. A separate startup experiment also lost a cloud observation after local reached its minimum, delaying confidence despite cheap local answers. Both tests stopped rather than repeating paid revalidation indefinitely.
 
@@ -32,7 +42,7 @@ The router now uses each admitted faster current cloud observation to permit one
 
 The earlier conservative revalidation implementation passed 174 tests per configuration and a 22-minute local-winning run, recorded below. The foreground-learning extension has dedicated tests for concurrent requests, reentrant observers, persisted reservations, failure, nil output, deadline, caller cancellation and owned-stream failure. Current verification and real-model outcomes are recorded in the qualification reports under `.build`.
 
-## Earlier verification
+### Earlier verification
 
 Seven deterministic regression tests cover admission ordering, duplicate history retention, in-flight timing admission, duplicate timestamps, manual overrides and observer reentrancy. Four isolated mutations demonstrate that the tests reject equal-path invalidation, ignored unequal transitions, stale ordering and a retained native baseline after a manual override.
 
@@ -40,13 +50,13 @@ The complete Debug/Release suite contains 169 tests. Consumer, demo, iOS compila
 
 The model workload must independently be suitable for both providers. Timing calibration does not grade model answers. The live scouting trials rejected a sentiment task after an incorrect local label, and checked the chosen keyword task against known YES/NO labels.
 
-## Default ten-minute live qualification
+### Default ten-minute live qualification
 
 A subsequent real YES/NO keyword-classification run completed 241 timed requests over 12 minutes. The default PCC probe ran 600.37 seconds after the preceding cloud call, admitted its observation, and changed the next cloud estimate from 0.666 to 0.746 seconds. The next request correctly stayed local with a 0.465-second prediction. There was one periodic PCC probe and no repeated hidden cloud call.
 
-Before quota-paced revalidation was added, a later native-unequal update cleared cloud history and caused three foreground PCC observations. Its compared public flags did not explain the native inequality, so its cause remains unknown; the implementation retains conservative invalidation for that class of event. The full reconciliation and raw trace are in `.build/network-reset-investigation` and `.build/live-local-quiet-probe`.
+Before quota-paced revalidation was added, a later native-unequal update cleared cloud history and caused three foreground PCC observations. Its public flags did not explain the change. That build discarded the timings. The current router retains timings for this class of event. The full reconciliation and raw trace are in `.build/network-reset-investigation` and `.build/live-local-quiet-probe`.
 
-## Current real-model revalidation result
+### Real-model revalidation on 11 November
 
 On 11 November, the updated signed router completed 441 timed requests over 22 minutes with default settings, native monitoring and no provider delays. Every timed foreground response stayed local; all 446 foreground labels including scouting were correct. Six PCC calls comprised four startup/scouting calls and two hidden probes, spaced 600.85 and 600.01 seconds after prior PCC use.
 
@@ -54,13 +64,13 @@ After a labelled same-coarse manual invalidation between requests, 240 requests 
 
 The physical network was not switched. Two opaque native inequalities were reproduced during startup; their private cause remains unknown. The deterministic tests verify eventual switching when the new cloud path is faster. The detailed report, raw trace, signed provenance and independent reconciliation are under `.build/live-network-revalidation`. SDK invocation counts do not identify exact billed quota units or provider-internal retries.
 
-## Real PCC return after bounded-learning fix
+### Real PCC return after bounded-learning fix
 
 A real 169-word extraction workload confirmed PCC faster. The previous three-spaced-probe recovery could lose its cloud observations to an unequal native update before confidence formed. The bounded foreground-learning extension passed the follow-up: one due hidden PCC probe at 603.70 seconds, two foreground learning answers to reach three current cloud observations, then qualified PCC selection. Eleven consecutive PCC answers included nine qualified selections; a default local refresh and the following actual decision correctly retained PCC, predicting 2.42 seconds versus 3.30 seconds local.
 
 All 37 foreground outputs in the final run were correct. It made 16 PCC calls; counting both earlier stopped experiments, total PCC use was 29 under the shared 30-call test ceiling. There were no duplicate provider dispatches. Current validation passed all 11 steps with 181 tests per Debug/Release configuration, 479/479 documented Swift declarations and four detected targeted mutations. Full protocol, failure history, raw trace, source/binary provenance and limits are in `.build/live-pcc-recovery/report.md`. The test kept default routing and provider settings, used real models without provider delays, and labelled its explicit manual invalidation; it did not physically switch Wi-Fi.
 
-## Longer mixed workload and bounded local learning
+### Longer mixed workload and bounded local learning
 
 The mixed-workload preparation exposed the reverse adaptation problem: a newly faster local observation could be outweighed by older slow local timings, leaving subsequent short answers on paid PCC. With the default zero saving margins and zero variability allowance, a fresh unused local observation that beats both the weighted and latest comparable cloud timings now permits one foreground local learning attempt. Permission is reserved and persisted before callbacks or suspension; only a new admitted success can reopen it. Failure, cancellation, deadline and ordinary relaunch cannot replay the same observation. Local learning leaves the PCC-use cooldown untouched. Explicit nonzero-margin/variability presets retain their comparison policy. The v1 cache adds an optional local-learning reservation timestamp; older caches still decode.
 
@@ -70,7 +80,7 @@ The complete 59-minute plan did not pass. At run second 2133.81, another opaque 
 
 All 63 foreground outputs were correct. All 70 native starts matched finishes; there were no duplicate provider dispatches, 33 foreground PCC calls and zero hidden PCC calls. Including the earlier seven-call stopped attempt, this experiment used 40 PCC calls under its shared 80-call ceiling. Current validation passed all 11 steps with 189 tests in each Debug/Release configuration, 100% documented declarations and 10/10 detected targeted mutations. Protocol, native timings, failure history, call reconciliation and frozen source/binary hashes are in `.build/live-mixed-default-long/report.md`. The run is incomplete as an overall live qualification; offline passing checks do not change that result.
 
-## Successful continuation through native invalidation
+### Successful continuation through native invalidation
 
 The follow-up resumed the saved 37 local observations and completed a continuous 33.1-minute real local -> PCC -> local sequence with default settings, no provider delays and no manual resets. All 66 foreground answers were correct. Two successful hidden PCC probes were admitted 629.770591 and 600.004164 seconds after prior PCC use. Their actual local/PCC timings were 0.454/0.709 and 0.395/0.746 seconds; three and four following requests stayed local. The intervening long-output phase measured local 3.491 versus PCC 2.865 seconds, followed by three qualified PCC decisions. It produced six consecutive qualified PCC selections overall. The final return used one free local learning answer and nine fully qualified local selections before another native invalidation.
 
@@ -82,7 +92,7 @@ This continuation made 18 PCC generation dispatches: 15 foreground answers, two 
 
 Preparation also fixed partial-cloud paid learning based on stale local averages: a fresh cloud result must beat both the weighted local prediction and its latest comparable observation. The regression passes, and both comparison-removal mutations were detected. Full current validation passed all 11 steps with 190 tests in each Debug/Release configuration and 100% documented declarations. The independent reviewer, observer-readiness fixtures and synthetic trace-analyzer fixtures found no remaining material issue in the scoped changes. Full phase/confidence distinctions, request-discovery costs, source/binary hashes, failure history and evidence are in `.build/live-mixed-probe-continuation/report.md`.
 
-## Avoided startup PCC cancellation
+### Avoided startup PCC cancellation
 
 A subsequent startup fix makes monitored owners defer optional paid cloud calibration until one successful live local measurement and accepted initial connection state exist. Native state or a newer explicit known manual connection can satisfy the connection prerequisite; unknown and stale observations cannot. Required foreground cloud work, recovery and free local probes remain available. Deferred requests consume neither cadence nor cloud-use cooldown, and no timer is added. Readiness is process-local and is not reclosed by ordinary mid-run updates.
 
@@ -92,7 +102,7 @@ The full 33.1-minute local -> PCC -> local follow-up passed: all 67 foreground a
 
 Review also fixed sample admission after a public availability predicate resets identity or cancels its task. Full validation passed all 11 steps with 203 tests in each Debug/Release configuration, 100% documentation coverage and six detected targeted mutations. The independent reviewer found no remaining material issue after rechecks. A future genuine transition can still interrupt already-started optional work; this is not a universal cancellation-prevention or billing guarantee. Before/after startup sequences, exact cache/source/binary hashes, confidence distinctions and limits are in `.build/live-startup-probe-guard/report.md`.
 
-## Repeated cold and warm launches (12 November)
+### Repeated cold and warm launches (12 November)
 
 A subsequent campaign passed eight serial fresh signed native processes with the real local and PCC models, default routing configuration, no startup settling wait and no injected provider delay. Cold means an empty routing profile; system model caches were untouched. Each launch executed eight immediate requests, alternating plain text and streaming, for 64 correct foreground answers (32 of each format).
 
@@ -100,7 +110,7 @@ Three cold launches each used three foreground PCC generations while admitting l
 
 All 74 native starts matched successful finishes: 64 local and 10 PCC. There were zero failures, cancellations, duplicate dispatches, rejected admissions or incorrect answers. The new campaign used 10 of its 20-generation cap, bringing cumulative audited mixed/startup qualification use to 86 PCC generations. Native API generations are counted; Apple billed quota units are not exposed. Eight native qualification processes do not establish iOS/GUI lifecycle behavior or force an unloaded system model. Full source/binary provenance, raw per-launch traces, exact profile snapshots, default settings and independent reconciliation are preserved in `.build/live-launch-consistency`. An initial historical-log format preflight failure started no native process and used zero PCC calls; its evidence is retained separately. Supervisor interruption/timeout regression checks passed with dummy processes before model execution.
 
-## Actual SwiftUI app launches (12 November)
+### Actual SwiftUI app launches (12 November)
 
 Six planned Launch Services launches of the actual signed RoutingDemo app passed the same class of cold/warm checks using visible UI controls and the real production Apple backend. The app retained Fastest, its five-second deadline and 256-token maximum; Apple models and Automatic were selected in the UI. Three empty-profile launches each used three foreground PCC calls to learn local timings and then selected local for three requests. Their three warm reopens reused the exact saved profile bytes, selected local immediately and made zero PCC invocations. All 36 foreground answers were correct, and all 45 native invocations matched successful finishes (36 local, 9 PCC), with no failures or cancellations. Cumulative audited qualification use is now 95 PCC invocations.
 
@@ -108,7 +118,7 @@ Preparation exposed and fixed a demo integration bug before real inference: disk
 
 Cold here still means an empty app routing profile, with system model caches untouched. The demo initializes its actual Apple router lazily when Run is pressed. This adds real macOS GUI lifecycle evidence; it does not establish iOS behavior, an unloaded system model, or billing units. Full per-launch cache snapshots, actual UI observations, SDK log pairs, exact defaults, code changes, validation and limits are in `.build/live-gui-launches/report.md`.
 
-## Longer mixed workload in the actual app (12–13 November)
+### Longer mixed workload in the actual app (12–13 November)
 
 The actual signed SwiftUI demo completed a 41.31-minute, one-process mixed workload with unchanged Fastest defaults (five-second demo deadline, 256-token output ceiling), real local/PCC models and no injected provider delays. All 45 foreground field-extraction answers were correct; all 51 native calls completed successfully (18 PCC, 33 local), with no cancellations or failures. Two optional PCC probes completed and were initially admitted at 623.986 and 648.458 seconds since preceding actual cloud use. The full-output phase established three consecutive qualified cloud choices; its paired measurement was PCC 2.773 versus local 3.557 seconds.
 
@@ -116,7 +126,7 @@ This is a partial qualification. Cloud-only history losses occurred at requests 
 
 NetworkExtension policy resets attributed to installed-app changes coincide with the first and third clearing windows. No matching event was found for the second window; private native-path causes remain unproven. The paid cooldown prevented extra relearning bursts, but stable reverse calibration and quota optimality cannot be signed off from this run. The app/source remained unchanged, the overall 30-new-PCC ceiling was respected, and the app/log observer were closed after completion. Cumulative audited live use is 113 PCC invocations. Full data, scope, negative evidence checks and an independent audit are in `.build/live-gui-mixed-default/report.md`.
 
-## Retained-history fix and completed actual-app rerun (13 November)
+### Retained-history fix and completed actual-app rerun (13 November)
 
 Opaque native inequalities and link-quality-only changes now preserve cloud history as prior evidence while still advancing generation, cancelling stale calibration and rejecting stale in-flight cloud timings. Exposed route, cost and capability changes and manual invalidation still clear history. The default paired refresh cadence is now one, giving eligible cloud requests a free local comparison so a faster local workload can be recognized sooner. Explicit cadence values remain supported; optional PCC probes still require at least 600 seconds since any actual cloud use. Retained opaque priors may be temporarily stale when public fields do not reveal a genuine network change.
 
@@ -126,7 +136,7 @@ Both optional probes ran after the real cooldown (633.617 and 635.854 seconds), 
 
 The resumed run used seven of its 18-call ceiling; adding the earlier disk-interrupted patched attempt gives nine PCC invocations against the combined 20-call ceiling. Cumulative audited use is 122 PCC invocations. The app, source and runtime binary identity were verified; the app and observer were closed afterward. The reconciliation passes, and five corrupted evidence copies are rejected. Source verification remains 208 Debug and 208 Release tests plus consumer/demo/iOS/docs checks and 100% measured declaration documentation coverage. Full settings, ledger, limits and source/control hashes are in `.build/live-gui-retained-history-resume/report.md`. This bounded result does not claim arbitrary-workload answer quality, universal fastest routing, billing units or global quota optimality.
 
-## Genuine native Wi-Fi change in the actual app (13 November)
+### Genuine native Wi-Fi change in the actual app (13 November)
 
 A real, guarded Wi-Fi loss/reconnection test passed in the same signed actual app with real local/PCC models and unchanged current defaults. The native monitor first reported a link-quality-only inequality that retained all 10 cloud samples, then material loss/recovery callbacks. The Wi-Fi destination bucket was cleared on recovery; all 83 pre-change local timings, owner identity and the exact paid cooldown timestamp remained. Stored inactive Wi-Fi timings remained during the offline interval, consistent with destination-bucket invalidation and connection-matched cloud estimates.
 
@@ -134,7 +144,7 @@ All six foreground answers were correct; all eight SDK calls succeeded (six loca
 
 The three-call PCC ceiling was respected; two calls were used, bringing cumulative audited qualification use to 124. Five offline restoration-guard regressions and five corrupted-evidence rejection checks pass. Production source remains unchanged from the previously verified build. This adds live retention/invalidation evidence for real connectivity loss/recovery and link-quality changes; different-network handoffs, active online opaque changes and in-flight interruption remain outside this live test. Full evidence, source/control hashes and limits are in `.build/live-gui-network-change/report.md`.
 
-## Latest provider-deadline fix: actual-app rerun (14 November)
+### Latest provider-deadline fix: actual-app rerun (14 November)
 
 The newly rebuilt signed app (SHA256 `4053b2bf…`, 24 pinned source/build inputs including NativeRetryAfter) completed a **42.46-minute** one-process real-model run with current defaults and no injected provider delays. All **25 foreground outputs** were correct; all **34 native calls** succeeded (25 local, nine PCC), with no cancelled/failed calls, duplicate generations or early optional probes. Both due probes were admitted and retained, spaced **649.115** and **630.054 seconds** after prior actual cloud use. All 88 original and 34 new observations remain; final history has 122 samples. Three naturally occurring online opaque native inequalities retained cloud priors without history clearing.
 

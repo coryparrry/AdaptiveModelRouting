@@ -79,7 +79,7 @@ public nonisolated struct PerformanceProfile: Codable, Sendable {
         if !availability.onDevice { return .init(route: .cloud, reason: .localUnavailable) }
         if !availability.cloud {
             return .init(route: .onDevice,
-                reason: availability.cloudQuota == .approachingLimit || availability.cloudQuota == .exhausted
+                reason: availability.cloudQuota.blocksCloud(for: policy, conserveQuota: configuration.conserveCloudQuota)
                     ? .cloudQuotaConserved : .cloudUnavailable)
         }
         if failures.contains(where: {

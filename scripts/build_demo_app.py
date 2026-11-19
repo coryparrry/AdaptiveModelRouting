@@ -56,12 +56,13 @@ def verify_staged(directory, environment):
     run_logged('verify-launch', ['codesign', '--verify', '--strict', str(app)], environment)
 
 
-def stop_running_demo():
-    """Stop the previously recorded process only when it still runs the owned executable."""
+def stop_running_demo(expected_pid=None):
+    """Stop only the recorded process or the one just confirmed by Launch Services."""
     existing = running_pid()
     if existing:
-        record = json.loads((BASE / 'last-launch.json').read_text())
-        if existing != record['pid']:
+        if expected_pid is None:
+            expected_pid = json.loads((BASE / 'last-launch.json').read_text())['pid']
+        if existing != expected_pid:
             raise RuntimeError('Refusing to stop a demo process not owned by this build script')
         os.kill(existing, signal.SIGTERM)
         deadline = time.monotonic() + 10
@@ -116,6 +117,26 @@ def build_bundle(directory, environment):
     return manifest
 
 
+def open_demo(workspace):
+    """Start the demo and commit ownership, stopping the confirmed process if recording fails."""
+    subprocess.run(['/usr/bin/open', '-n', str(APP)], check=True)
+    deadline = time.monotonic() + 10
+    pid = running_pid()
+    while pid is None and time.monotonic() < deadline:
+        time.sleep(.1)
+        pid = running_pid()
+    if pid is None:
+        raise RuntimeError('Launch Services did not start the staged demo')
+    try:
+        new_record = workspace / 'last-launch.json'
+        new_record.write_text(json.dumps({'pid': pid, 'at': time.time(), 'bundle': str(APP)}, indent=2) + '\n')
+        new_record.replace(BASE / 'last-launch.json')
+    except BaseException:
+        stop_running_demo(expected_pid=pid)
+        raise
+    return pid
+
+
 def prepare_and_launch(mode, environment):
     """Select the latest verified candidate and promote it only for an explicit launch."""
     staged = BASE / 'staged'
@@ -137,35 +158,38 @@ def prepare_and_launch(mode, environment):
             if mode == '--build-only':
                 return None
 
+        manifest_path = BASE / 'provenance.json'
+        prior_manifest = workspace / 'prior-provenance.json'
         if selected == staged:
             # Prepare a complete launch copy before asking an existing demo to exit.
             prepared = workspace / APP.name
             shutil.copytree(staged / APP.name, prepared, symlinks=True)
             shutil.copy2(staged / 'provenance.json', workspace / 'provenance.json')
             verify_staged(workspace, environment)
-            stop_running_demo()
+            if manifest_path.exists():
+                shutil.copy2(manifest_path, prior_manifest)
+
+        stop_running_demo()
+        launch_record = BASE / 'last-launch.json'
+        launch_record.unlink(missing_ok=True)
+        if selected == staged:
             prior_app = workspace / 'prior-app'
             install_directory(prepared, APP, prior_app)
             try:
-                (workspace / 'provenance.json').replace(BASE / 'provenance.json')
+                (workspace / 'provenance.json').replace(manifest_path)
+                pid = open_demo(workspace)
             except BaseException:
-                # Keep the live executable paired with the manifest that actually reached disk.
+                # Keep the previous installation until the replacement starts and its pid is recorded.
                 APP.rename(prepared)
                 if prior_app.exists():
                     prior_app.rename(APP)
+                if prior_manifest.exists():
+                    prior_manifest.rename(manifest_path)
+                else:
+                    manifest_path.unlink(missing_ok=True)
                 raise
         else:
-            stop_running_demo()
-
-    subprocess.run(['/usr/bin/open', '-n', str(APP)], check=True)
-    deadline = time.monotonic() + 10
-    pid = running_pid()
-    while pid is None and time.monotonic() < deadline:
-        time.sleep(.1)
-        pid = running_pid()
-    if pid is None:
-        raise RuntimeError('Launch Services did not start the staged demo')
-    (BASE / 'last-launch.json').write_text(json.dumps({'pid': pid, 'at': time.time(), 'bundle': str(APP)}, indent=2) + '\n')
+            pid = open_demo(workspace)
     print(json.dumps({'launched': True, 'pid': pid, 'bundle': str(APP)}), flush=True)
     return pid
 

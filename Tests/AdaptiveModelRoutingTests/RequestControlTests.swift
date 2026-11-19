@@ -21,6 +21,34 @@ final class RequestControlTests: XCTestCase {
         singleProviderRouter(monitorConnection: false, configuration: configuration, persistence: .memoryOnly)
     }
 
+    /// A near-limit warning explains local selection only when it actually blocks automatic cloud use.
+    func testNearLimitReasonWithConservationDisabled() async throws {
+        let router = router(configuration: .init(conserveCloudQuota: false))
+        let unavailable = RoutingAvailability(cloud: false, cloudQuota: .approachingLimit)
+        let ready = RoutingAvailability(cloud: true, cloudQuota: .approachingLimit)
+        let profileDecision = router.profile.decision(inputTokens: 10, localCapacity: 4096,
+            connection: .init(kind: .wifi), now: .now, configuration: router.configuration, availability: unavailable)
+        XCTAssertEqual(profileDecision.reason, .cloudUnavailable)
+
+        let local = try await router.respondDetailed(inputTokens: 10, localContextCapacity: 4096, availability: unavailable,
+            cloud: { XCTFail("Unavailable cloud provider was called"); return "cloud" }, onDevice: { "local" })
+        XCTAssertEqual(local.decision.reason, .cloudUnavailable)
+        XCTAssertEqual(local.attempts.map(\.route), [.onDevice])
+
+        let reset = Date.now.addingTimeInterval(600)
+        do {
+            _ = try await router.respondDetailed(inputTokens: 10, localContextCapacity: 4096, policy: .cloudRequired,
+                availability: ready, cloud: { throw Throttle(routingRetryAfter: reset) }, onDevice: { "local" })
+            XCTFail("Expected the cloud provider to return its retry date.")
+        } catch is Throttle {}
+        let duringBackoff = try await router.respondDetailed(inputTokens: 10, localContextCapacity: 4096, availability: ready,
+            cloud: { XCTFail("Cloud was called during backoff"); return "cloud" }, onDevice: { "local" })
+        XCTAssertEqual(duringBackoff.decision.reason, .cloudBackoff)
+        XCTAssertEqual(duringBackoff.attempts.map(\.route), [.onDevice])
+        XCTAssertEqual(router.decision(inputTokens: 10, localCapacity: 4096,
+            now: reset.addingTimeInterval(1), availability: ready).route, .cloud)
+    }
+
     /// Local-only policy overrides a contradictory preference and never retries cloud after local failure.
     func testLocalOnlyNeverCallsCloud() async throws {
         for fails in [false, true] {

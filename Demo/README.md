@@ -18,6 +18,27 @@ swift test --package-path Demo
 
 The sample has one package dependency, `AdaptiveModelRouting`. Its internal support target lets the app's asynchronous state flow be tested without opening a GUI.
 
-The run script stages a signed macOS app bundle and launches it through Launch Services. Use `./script/build_and_run.sh --build-only` to prepare a candidate while keeping the running demo open. Use `--verify` to check the staged candidate or `--launch-only` to switch to it. Ad-hoc signing supports the simulated demo. Real PCC testing additionally requires a development identity and an approved provisioning profile; signing assets can be supplied through `ROUTING_DEMO_SIGNING_ASSETS` and `ROUTING_DEMO_SIGNING_IDENTITY`.
+The run script stages a signed macOS app bundle and launches it through Launch Services. Use `./script/build_and_run.sh --build-only` to prepare a candidate while keeping the running demo open. Use `--verify` to check the staged candidate or `--launch-only` to switch to it. Ad-hoc signing supports the simulated demo.
+
+## Sign the demo for Private Cloud Compute
+
+For a live PCC request, use a macOS development signing identity in your keychain and a provisioning profile approved for the app's PCC entitlement. Set `ROUTING_DEMO_SIGNING_ASSETS` to a directory containing these files at the exact relative paths shown.
+
+| Path inside the signing directory | Contents |
+|---|---|
+| `Info.plist` | A `CFBundleIdentifier` matching the app ID covered by your profile. The launcher uses this identifier for the demo. |
+| `entitlements.plist` | The entitlements to pass to `codesign`, including the managed PCC entitlement authorized by your profile. |
+| `LiveRouterQualification.app/Contents/embedded.provisionprofile` | The macOS provisioning profile to embed in the demo. The launcher reads only this file from that bundle path. |
+
+From the repository root, substitute your directory and signing identity, then build and launch the signed candidate.
+
+```sh
+export ROUTING_DEMO_SIGNING_ASSETS="/absolute/path/to/signing-assets"
+export ROUTING_DEMO_SIGNING_IDENTITY="Apple Development: Your Name (IDENTIFIER)"
+./script/build_and_run.sh --build-only
+./script/build_and_run.sh --launch-only
+```
+
+Select **Apple models** and **Cloud required** when you are ready to make a live PCC request.
 
 For content-free native call diagnostics, use `./script/build_and_run.sh --telemetry`. The `AdaptiveModelRouting` / `NativeInference` unified debug log records invocation IDs, route, format, completion and duration, without prompts or answers.

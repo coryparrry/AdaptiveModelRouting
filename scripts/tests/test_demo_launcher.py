@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,99 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual((launcher.BASE / 'provenance.json').read_bytes(), previous)
         staged_binary = launcher.BASE / 'staged' / launcher.BINARY.relative_to(launcher.BASE)
         self.assertEqual(staged_binary.read_bytes(), b'new executable')
+
+    def check_failed_launch_and_retry(self, previous_binary, previous_manifest):
+        """Exercise an open error and a missing process before retrying the same staged build."""
+        manifest = launcher.BASE / 'provenance.json'
+        record = launcher.BASE / 'last-launch.json'
+        for failure in ('open', 'timeout'):
+            with self.subTest(failure=failure):
+                record.write_text('{"pid": 123}')
+                open_error = subprocess.CalledProcessError(1, ['open']) if failure == 'open' else None
+                with patch.object(launcher, 'stop_running_demo'), patch.object(launcher, 'run_logged'), \
+                        patch.object(launcher.subprocess, 'run', side_effect=open_error), \
+                        patch.object(launcher, 'running_pid', return_value=None), \
+                        patch.object(launcher.time, 'monotonic', side_effect=[0, 11]):
+                    with self.assertRaises(subprocess.CalledProcessError if open_error else RuntimeError):
+                        launcher.prepare_and_launch('--launch-only', {})
+                if previous_binary is None:
+                    self.assertFalse(launcher.APP.exists())
+                    self.assertFalse(manifest.exists())
+                else:
+                    self.assertEqual(launcher.BINARY.read_bytes(), previous_binary)
+                    self.assertEqual(manifest.read_bytes(), previous_manifest)
+                self.assertFalse(record.exists(), 'A stopped process must have no ownership record')
+
+        with patch.object(launcher, 'stop_running_demo'), patch.object(launcher, 'run_logged'), \
+                patch.object(launcher.subprocess, 'run'), patch.object(launcher, 'running_pid', return_value=456), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(launcher.prepare_and_launch('--launch-only', {}), 456)
+        self.assertEqual(launcher.BINARY.read_bytes(), b'new executable')
+        self.assertEqual(manifest.read_bytes(), (launcher.BASE / 'staged/provenance.json').read_bytes())
+        self.assertEqual(json.loads(record.read_text())['pid'], 456)
+
+    def test_failed_replacement_restores_installed_build_until_retry(self):
+        """Launch errors restore both artifacts from the working installation."""
+        self.stage_fixture()
+        self.check_failed_launch_and_retry(launcher.BINARY.read_bytes(), (launcher.BASE / 'provenance.json').read_bytes())
+
+    def test_failed_first_install_leaves_only_staged_build_for_retry(self):
+        """A first launch without a working predecessor keeps the verified stage available for retry."""
+        self.stage_fixture()
+        shutil.rmtree(launcher.APP)
+        (launcher.BASE / 'provenance.json').unlink()
+        self.check_failed_launch_and_retry(None, None)
+
+    def test_failed_legacy_launch_preserves_only_bundle(self):
+        """An older single-bundle layout has no staged replacement to undo."""
+        manifest = launcher.BASE / 'provenance.json'
+        previous_manifest = manifest.read_bytes()
+        record = launcher.BASE / 'last-launch.json'
+        record.write_text('{"pid": 123}')
+        with patch.object(launcher, 'stop_running_demo'), patch.object(launcher, 'run_logged'), \
+                patch.object(launcher.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, ['open'])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                launcher.prepare_and_launch('--launch-only', {})
+        self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+        self.assertEqual(manifest.read_bytes(), previous_manifest)
+        self.assertFalse(record.exists())
+
+    def test_failed_launch_record_stops_confirmed_process_and_restores_install(self):
+        """A running replacement must be stopped before rolling back an unrecorded launch."""
+        self.stage_fixture()
+        manifest = launcher.BASE / 'provenance.json'
+        previous_manifest = manifest.read_bytes()
+        record = launcher.BASE / 'last-launch.json'
+        for method in ('write_text', 'replace'):
+            with self.subTest(method=method):
+                original = getattr(Path, method)
+
+                def fail_record(path, *args, **kwargs):
+                    """Fail only the ownership write or rename after the candidate is running."""
+                    if path.name == record.name:
+                        raise PermissionError('test launch record failure')
+                    return original(path, *args, **kwargs)
+
+                def stop_candidate(pid, signum):
+                    """Require the matching candidate to be installed when the signal is sent."""
+                    self.assertEqual(launcher.BINARY.read_bytes(), b'new executable')
+                    self.assertEqual((pid, signum), (456, launcher.signal.SIGTERM))
+
+                with patch.object(Path, method, fail_record), patch.object(launcher, 'run_logged'), \
+                        patch.object(launcher.subprocess, 'run'), patch.object(launcher, 'running_pid', \
+                            side_effect=[None, 456, 456, None, None]), \
+                        patch.object(launcher.os, 'kill', side_effect=stop_candidate) as kill:
+                    with self.assertRaisesRegex(PermissionError, 'test launch record failure'):
+                        launcher.prepare_and_launch('--launch-only', {})
+                    kill.assert_called_once()
+                self.assertEqual(launcher.BINARY.read_bytes(), b'fixture executable')
+                self.assertEqual(manifest.read_bytes(), previous_manifest)
+                self.assertFalse(record.exists())
+
+        with patch.object(launcher, 'run_logged'), patch.object(launcher.subprocess, 'run'), \
+                patch.object(launcher, 'running_pid', side_effect=[None, 789]), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(launcher.prepare_and_launch('--launch-only', {}), 789)
+        self.assertEqual(json.loads(record.read_text())['pid'], 789)
 
     def test_launch_only_requires_exact_input_set(self):
         """Adding, removing or editing a source rejects launch before disturbing the current app."""
