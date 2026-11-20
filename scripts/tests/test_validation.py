@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -61,6 +62,22 @@ final class Example {
 
 class RunnerTests(unittest.TestCase):
     """Check command outcomes, evidence and timeout behavior using harmless child processes."""
+
+    def test_ios_checks_include_release_usage_product(self):
+        """Validate core availability and compile the production usage path on the iOS device target."""
+        args = Namespace(configuration="debug", skip_demo=True, skip_ios=False, skip_docs=True)
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(validate.subprocess, "check_output", side_effect=["27.3", "/sdk/iPhoneOS.sdk"]), \
+                patch.object(validate, "run_step") as steps:
+            validate.validate(args, Path(folder), [])
+
+        commands = {call.args[0]: call.args[1] for call in steps.call_args_list}
+        core = commands["ios-availability"]
+        usage = commands["ios-usage-availability"]
+        self.assertEqual(core[core.index("--target") + 1], "AdaptiveModelRouting")
+        self.assertEqual(usage[usage.index("--target") + 1], "AdaptiveModelRoutingUsage")
+        self.assertEqual(usage[usage.index("-c") + 1], "release")
+        self.assertEqual(usage[usage.index("--triple") + 1], "arm64-apple-ios26.0")
 
     def test_success_and_failure_evidence(self):
         """A failed command preserves its exact exit code and full log alongside earlier successes."""

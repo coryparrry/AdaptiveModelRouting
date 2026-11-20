@@ -49,6 +49,22 @@ final class UsageReporterTests: XCTestCase {
         XCTAssertTrue(versions.isEmpty)
     }
 
+    /// Reports a later success if consent returns before any send began.
+    func testRestoredConsentAllowsFirstSend() async {
+        let capture = CapturedReports()
+        let reporter = UsageReporter(packageVersion: "0.2.0", eligible: true) { await capture.append($0) }
+        reporter.setEnabled(true)
+        reporter.recordSuccessfulUse()
+        reporter.setEnabled(false)
+        reporter.setEnabled(true)
+        reporter.recordSuccessfulUse()
+        reporter.recordSuccessfulUse()
+
+        await reporter.waitForReport()
+        let versions = await capture.versions
+        XCTAssertEqual(versions, ["0.2.0"])
+    }
+
     /// Rejects configurations that would send to HTTP or include a query or credentials.
     func testRejectsInvalidCollectorURL() {
         for string in ["http://worker.example/v1/used", "https://worker.example/other",
