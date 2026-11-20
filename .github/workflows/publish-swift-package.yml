@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       source_sha:
-        description: Full commit SHA of the merged release PR
+        description: Full main commit SHA targeted by the release draft
         required: true
         type: string
       publish:
@@ -34,7 +34,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write # GitHub requires push access to list drafts.
-      pull-requests: read
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
       draft: ${{ steps.draft.outputs.draft }}
@@ -88,7 +87,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
-      pull-requests: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

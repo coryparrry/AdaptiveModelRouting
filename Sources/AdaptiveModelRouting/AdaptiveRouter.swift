@@ -43,6 +43,8 @@ public final class AdaptiveRouter {
     private var lastPathUpdate: ContinuousClock.Instant?
     private var lastNativePath: NWPath?
     private var lastLocalLearning: Date?
+    /// Reads monotonic time for latency samples. Deterministic tests can supply a controlled clock.
+    var measurementTime: (InferenceRoute) -> ContinuousClock.Instant = { _ in .now }
     /// Supports opt-in, content-free diagnostics in integration qualification without built-in telemetry.
     var onConnectionObservation: ((RoutingConnectionObservation) -> Void)?
     private let directory: URL
@@ -435,8 +437,8 @@ public final class AdaptiveRouter {
         available: (Value) -> Bool = { _ in true },
         operation: () async throws -> Value
     ) async throws -> Value {
-        let clock = ContinuousClock()
-        let started = clock.now
+        let measurementTime = self.measurementTime
+        let started = measurementTime(model)
         let slowWatch: Task<Void, Never>? = model == .cloud ? Task { [weak self, slowCloudAfter = configuration.slowCloudAfter] in
             do { try await Task.sleep(for: slowCloudAfter) }
             catch { return }
@@ -453,7 +455,7 @@ public final class AdaptiveRouter {
                 slowWatch?.cancel()
             }
             try Task.checkCancellation()
-            let elapsed = started.duration(to: clock.now).components
+            let elapsed = started.duration(to: measurementTime(model)).components
             let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
             if snapshot.profileGeneration == profileGeneration && (model == .onDevice || snapshot.generation == generation) {
                 let accepted = available(result)

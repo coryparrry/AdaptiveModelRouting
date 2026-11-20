@@ -77,16 +77,11 @@ def can_propose():
     return True
 
 
-def require_release_pr(sha):
-    """Require the draft source to be the merge commit of this repository's release PR."""
-    repository = os.environ["GITHUB_REPOSITORY"]
-    pulls = api(f"/commits/{sha}/pulls")
-    if not any(pr["merged_at"] and pr["merge_commit_sha"] == sha
-               and pr["base"]["ref"] == "main"
-               and pr["head"]["repo"] and pr["head"]["repo"]["full_name"] == repository
-               and pr["head"]["ref"].startswith("release-please--branches--main")
-               for pr in pulls):
-        raise ValueError(f"{sha} is not the merge commit of a Release Please PR into main")
+def require_main_commit(sha):
+    """Allow the release PR commit or a reviewed fix that has landed on main."""
+    comparison = api(f"/compare/{sha}...main?per_page=1")
+    if comparison["status"] not in ("ahead", "identical") or comparison["merge_base_commit"]["sha"] != sha:
+        raise ValueError(f"Release commit {sha} must still be on main")
 
 
 def resolve(tag, sha, publishing=False):
@@ -108,7 +103,7 @@ def resolve(tag, sha, publishing=False):
         raise ValueError(f"Draft {tag} already has a Git tag. Inspect it before publishing.")
     if release["target_commitish"] != sha or manifest_tag("main") != tag or manifest_tag(sha) != tag:
         raise ValueError(f"Draft {tag}, main, and release commit {sha} must agree")
-    require_release_pr(sha)
+    require_main_commit(sha)
     return release
 
 

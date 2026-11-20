@@ -51,19 +51,34 @@ class ReleaseTests(unittest.TestCase):
                 release.resolve(TAG, COMMIT, publishing=True)
         api.assert_called_once_with("")
 
-    def test_draft_matches_the_version_and_release_pr(self):
+    def test_draft_matches_the_version_and_main(self):
         """Accept the exact draft, and reject a different SHA or an existing Git tag."""
         with (patch.object(release, "find_release", return_value=DRAFT),
               patch.object(release, "tag_commit", return_value=None) as ref,
               patch.object(release, "manifest_tag", return_value=TAG),
-              patch.object(release, "require_release_pr") as require_pr):
+              patch.object(release, "require_main_commit") as require_main):
             self.assertEqual(release.resolve(TAG, COMMIT), DRAFT)
-            require_pr.assert_called_once_with(COMMIT)
+            require_main.assert_called_once_with(COMMIT)
             with self.assertRaisesRegex(ValueError, "must agree"):
                 release.resolve(TAG, OTHER_COMMIT)
             ref.return_value = COMMIT
             with self.assertRaisesRegex(ValueError, "already has a Git tag"):
                 release.resolve(TAG, COMMIT)
+
+    def test_candidate_belongs_to_current_main(self):
+        """Accept a release commit on main and reject an unrelated or removed commit."""
+        comparison = {"status": "ahead", "merge_base_commit": {"sha": COMMIT}}
+        with patch.object(release, "api", return_value=comparison) as api:
+            release.require_main_commit(COMMIT)
+            api.assert_called_once_with(f"/compare/{COMMIT}...main?per_page=1")
+            comparison["status"] = "identical"
+            release.require_main_commit(COMMIT)
+            comparison["merge_base_commit"]["sha"] = OTHER_COMMIT
+            with self.assertRaisesRegex(ValueError, "must still be on main"):
+                release.require_main_commit(COMMIT)
+            comparison.update(status="behind", merge_base_commit={"sha": COMMIT})
+            with self.assertRaisesRegex(ValueError, "must still be on main"):
+                release.require_main_commit(COMMIT)
 
     def test_published_retry_requires_same_commit(self):
         """Verify an existing stable publication and reject a moved version tag."""
