@@ -79,7 +79,7 @@ private struct DemoStoragePreferences: Codable {
 
 /// Keeps a provider's adapter and its calibration state together.
 @MainActor
-private enum DemoRoutingOwner {
+enum DemoRoutingOwner {
     case simulated(AdaptiveRouter)
     case apple(FoundationModelsRouter)
 
@@ -89,6 +89,12 @@ private enum DemoRoutingOwner {
         case .simulated(let router): router
         case .apple(let adapter): adapter.router
         }
+    }
+
+    /// Creates a fixture workload with the same storage controls as the native demo.
+    static func fixture(cacheRoot: URL, configuration: RoutingConfiguration, persistence: RoutingPersistence) -> Self {
+        .simulated(AdaptiveRouter(directory: cacheRoot, monitorConnection: false,
+            configuration: configuration, persistence: persistence, calibrationIdentifier: "simulated-v1"))
     }
 }
 
@@ -127,6 +133,7 @@ public final class DemoModel {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var visibleWindows = Set<UUID>()
     @ObservationIgnored private let cacheRoot: URL
+    @ObservationIgnored private let makeAppleOwner: (URL, RoutingConfiguration, RoutingPersistence) -> DemoRoutingOwner
     private var storagePreferences = DemoStoragePreferences()
     @ObservationIgnored private lazy var simulatedOwner = makeOwner(for: .simulated)
     @ObservationIgnored private lazy var appleOwner = makeOwner(for: .apple)
@@ -139,8 +146,18 @@ public final class DemoModel {
     var activeRouter: AdaptiveRouter { owner.router }
 
     /// Starts with fixture routing and restores only the user's explicit calibration-storage preference.
-    public init(cacheRoot: URL = URL.applicationSupportDirectory.appendingPathComponent("AdaptiveModelRoutingDemo")) {
+    public convenience init(cacheRoot: URL = URL.applicationSupportDirectory.appendingPathComponent("AdaptiveModelRoutingDemo")) {
+        self.init(cacheRoot: cacheRoot) { directory, configuration, persistence in
+            .apple(FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.",
+                configuration: configuration, options: .init(maximumResponseTokens: 256),
+                cacheRoot: directory, persistence: persistence))
+        }
+    }
+
+    /// Allows demo tests to exercise both modes without initializing an Apple model.
+    init(cacheRoot: URL, makeAppleOwner: @escaping (URL, RoutingConfiguration, RoutingPersistence) -> DemoRoutingOwner) {
         self.cacheRoot = cacheRoot
+        self.makeAppleOwner = makeAppleOwner
         // A legacy global Boolean cannot establish permission for either individual mode.
         if let data = try? Data(contentsOf: cacheRoot.appendingPathComponent("storage-preference.json")),
            let preferences = try? JSONDecoder().decode(DemoStoragePreferences.self, from: data) {
@@ -306,12 +323,10 @@ public final class DemoModel {
         let persistence: RoutingPersistence = storagePreferences[mode] ? .disk : .memoryOnly
         switch mode {
         case .apple:
-            return .apple(FoundationModelsRouter(workload: "demo", instructions: "Answer clearly and concisely.",
-                configuration: configuration, options: .init(maximumResponseTokens: 256),
-                cacheRoot: cacheRoot.appendingPathComponent("apple"), persistence: persistence))
+            return makeAppleOwner(cacheRoot.appendingPathComponent("apple"), configuration, persistence)
         case .simulated:
-            return .simulated(AdaptiveRouter(directory: cacheRoot.appendingPathComponent("simulated"), monitorConnection: false,
-                configuration: configuration, persistence: persistence, calibrationIdentifier: "simulated-v1"))
+            return .fixture(cacheRoot: cacheRoot.appendingPathComponent("simulated"),
+                configuration: configuration, persistence: persistence)
         }
     }
 
