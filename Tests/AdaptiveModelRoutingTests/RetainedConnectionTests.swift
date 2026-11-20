@@ -79,13 +79,18 @@ final class RetainedConnectionTests: XCTestCase {
     /// Faster current local evidence stops subsequent paid foreground work rather than waiting ten requests.
     func testDefaultSwitchBackUsesOnePaidRequest() async throws {
         let router = AdaptiveRouter(monitorConnection: false, persistence: .memoryOnly)
+        var cloudTime = ContinuousClock.now
+        var localTime = cloudTime
+        router.measurementTime = { $0 == .cloud ? cloudTime : localTime }
         router.updateConnection(wifi)
         for _ in 0..<3 {
             _ = try await router.measure(model: .onDevice, inputTokens: 100, snapshot: router.snapshot()) {
-                try await Task.sleep(for: .milliseconds(80)); return "full"
+                localTime = localTime.advanced(by: .milliseconds(80))
+                return "full"
             }
             _ = try await router.measure(model: .cloud, inputTokens: 100, snapshot: router.snapshot()) {
-                try await Task.sleep(for: .milliseconds(40)); return "full"
+                cloudTime = cloudTime.advanced(by: .milliseconds(40))
+                return "full"
             }
         }
         var paid = 0
@@ -93,8 +98,16 @@ final class RetainedConnectionTests: XCTestCase {
         var routes: [InferenceRoute?] = []
         for _ in 0..<5 {
             let result = try await router.respondDetailed(inputTokens: 100, localContextCapacity: 8192,
-                cloud: { paid += 1; try await Task.sleep(for: .milliseconds(20)); return "short" },
-                onDevice: { local += 1; try await Task.sleep(for: .milliseconds(1)); return "short" })
+                cloud: {
+                    paid += 1
+                    cloudTime = cloudTime.advanced(by: .milliseconds(20))
+                    return "short"
+                },
+                onDevice: {
+                    local += 1
+                    localTime = localTime.advanced(by: .milliseconds(1))
+                    return "short"
+                })
             routes.append(result.route)
             await router.waitForCalibration()
         }
