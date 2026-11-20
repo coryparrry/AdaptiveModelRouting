@@ -18,7 +18,9 @@ The repository owner controls public visibility. Before making it public, review
 
 After a successful rehearsal, run the same workflow from `main` with the same tag and full SHA and select **Publish**. The workflow repeats the staging checks, rechecks the draft and remote tag, and publishes the draft. Publication creates the stable Git tag that Xcode and SwiftPM use. The verification job independently resolves and builds that version from the public GitHub URL and compares the resolved commit to the staged commit.
 
-If staging fails and the fix changes the source, merge the fix through the required checks on `main`. Confirm the release is still a draft and the version has no Git tag. Set that draft's `target_commitish` to the full fix commit SHA through the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases#update-a-release). Review the draft notes and run staging with the new SHA. The manifest at the selected commit and on `main` must match the draft version.
+If staging fails and the fix changes the source, merge the fix through the required checks on `main`. Confirm the release is still a draft and the version has no Git tag. Update the draft through the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases#update-a-release). Send both the intended `tag_name` and the full fix commit SHA as `target_commitish`. GitHub can replace an omitted tag name with an `untagged-…` placeholder.
+
+Confirm the updated release is still a draft with the intended tag name and target SHA, and that the Git tag is still absent. Review the draft notes and run staging with the new SHA. The manifest at the selected commit and on `main` must match the draft version.
 
 A conflicting or orphaned tag stops the workflow for inspection. If publication succeeds and verification fails, rerun with the same tag and SHA to verify again. Published tags are immutable by convention. Release a newer version to correct a package defect.
 
