@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import AdaptiveModelRouting
@@ -185,7 +186,7 @@ final class RoutingAccuracyTests: XCTestCase {
         }
     }
 
-    /// Measures routing overhead over a full bounded history without model latency or broad performance claims.
+    /// Caps CPU time for synchronous routing decisions over a full bounded history.
     func testBoundedHistoryDecisionBenchmark() throws {
         var profile = PerformanceProfile()
         let now = Date.now
@@ -194,16 +195,18 @@ final class RoutingAccuracyTests: XCTestCase {
             profile.record(model: .onDevice, tokens: 100, seconds: 0.3, connection: .init(kind: .wifi), now: date)
             profile.record(model: .cloud, tokens: 100, seconds: 0.6, connection: .init(kind: .wifi), now: date)
         }
-        let began = ContinuousClock.now
+        // Thread CPU time excludes time when a shared runner schedules other work.
+        let began = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         var local = 0
         for _ in 0..<10_000 {
             if profile.choose(inputTokens: 100, localCapacity: 8_192, connection: .init(kind: .wifi), now: now) == .onDevice { local += 1 }
         }
-        let elapsed = began.duration(to: .now).components
-        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        let finished = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+        let cpuSeconds = (Double(finished) - Double(began)) / 1e9
         XCTAssertEqual(local, 10_000)
-        XCTAssertLessThan(seconds, 5, "Bounded-history routing should not require model-scale CPU time.")
-        print("Routing benchmark: 10000 decisions, \(seconds) seconds, \(seconds * 100) microseconds/decision")
+        XCTAssertGreaterThan(cpuSeconds, 0, "The benchmark must record CPU time.")
+        XCTAssertLessThan(cpuSeconds, 5, "Bounded-history routing should not require model-scale CPU time.")
+        print("Routing benchmark: 10000 decisions, \(cpuSeconds) CPU seconds, \(cpuSeconds * 100) CPU microseconds/decision")
     }
 
     /// Saves deterministic scenario traces for accuracy/regret and quota inspection without logging prompts.
