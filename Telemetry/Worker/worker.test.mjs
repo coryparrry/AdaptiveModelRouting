@@ -56,7 +56,7 @@ test("stores only an atomic daily version total even with simultaneous requests"
 
 test("rejects extra data, oversized bodies, unknown versions, and URLs with queries", async (t) => {
   const { db, env } = fixture(t);
-  for (const body of ["", "0.2.0\nprivate input", "0.2.1", "0".repeat(510)]) {
+  for (const body of ["", "\uFEFF0.2.0", "0.2.0\nprivate input", "0.2.1", "0".repeat(510)]) {
     assert.equal((await report(env, body)).status, 400);
   }
   assert.equal((await report(env, "0.2.0", usageURL + "?identity=forbidden")).status, 404);

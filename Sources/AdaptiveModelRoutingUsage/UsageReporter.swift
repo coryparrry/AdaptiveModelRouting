@@ -29,15 +29,18 @@ public final class UsageReporter {
     /// Enables reporting only when the app has consent, and cancels outstanding work on withdrawal.
     public func setEnabled(_ enabled: Bool) {
         self.enabled = enabled
-        if !enabled { task?.cancel() }
+        if !enabled {
+            task?.cancel()
+            task = nil
+        }
     }
 
     /// Call after a successful foreground request. Sending is best-effort and never delays inference.
     public func recordSuccessfulUse() {
-        guard eligible, enabled, !attempted else { return }
-        attempted = true
+        guard eligible, enabled, !attempted, task == nil else { return }
         task = Task { [report, version] in
             guard !Task.isCancelled else { return }
+            attempted = true
             await report(version)
         }
     }

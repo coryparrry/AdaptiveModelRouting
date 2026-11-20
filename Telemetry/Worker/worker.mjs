@@ -12,7 +12,8 @@ async function readVersion(body) {
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return new TextDecoder().decode(bytes.subarray(0, size));
+      // Preserve any BOM in the decoded string so the version check rejects it.
+      if (done) return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(0, size));
       if (size + value.length > bytes.length) {
         await reader.cancel();
         return null;

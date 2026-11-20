@@ -133,8 +133,11 @@ def validate(args: argparse.Namespace, artifacts: Path, results: list) -> None:
                  str(artifacts / "demo-build"), *cache], artifacts, environment, results)
     if not args.skip_ios:
         ios_sdk = subprocess.check_output(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], text=True).strip()
-        run_step("ios-availability", ["swift", "build", "--target", "AdaptiveModelRouting", "--triple", "arm64-apple-ios26.0",
-                 "--sdk", ios_sdk, "--scratch-path", str(artifacts / "ios-build"), *cache], artifacts, environment, results)
+        ios_build = ["swift", "build", "--triple", "arm64-apple-ios26.0", "--sdk", ios_sdk,
+                     "--scratch-path", str(artifacts / "ios-build"), *cache]
+        run_step("ios-availability", [*ios_build, "--target", "AdaptiveModelRouting"], artifacts, environment, results)
+        run_step("ios-usage-availability", [*ios_build, "--target", "AdaptiveModelRoutingUsage", "-c", "release"],
+                 artifacts, environment, results)
     if not args.skip_docs:
         symbols = artifacts / "symbols"
         symbols.mkdir(exist_ok=True)
