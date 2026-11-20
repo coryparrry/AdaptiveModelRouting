@@ -1,6 +1,6 @@
 # AdaptiveModelRouting
 
-AdaptiveModelRouting is a Swift package for iOS and macOS that routes language model requests between an on-device model and a cloud model such as Apple’s Private Cloud Compute. When either model can do the job, it learns from response times on the device and chooses the provider it expects to answer faster for the request size and current connection.
+AdaptiveModelRouting is a Swift package for iOS and macOS that routes language model requests between on-device and cloud models, including Apple Foundation Models and Private Cloud Compute. When both providers are allowed, it learns from measured response times and chooses the one it expects to answer faster for the request size and current connection.
 
 - **Control where each prompt goes.** Use `.localOnly` to keep a sensitive request on the device, `.cloudRequired` for a task that needs the cloud model, or `.automatic` to let the router choose. By default, automatic calibration can send the same prompt to both providers.
 - **Recover from temporary failures.** The router can try another permitted provider if a request fails. Once it publishes a streaming update, it stays with that provider. The Apple adapter also respects reset dates reported by PCC quota and Foundation Models rate-limit errors.
@@ -11,13 +11,19 @@ Build with an iOS or macOS 27 SDK. The core router supports iOS 26+ and macOS 26
 
 ## Add the package
 
-This repository is private. Version 0.1.0 predates the Apple adapter. To try this candidate, place its checkout beside your app’s package and add it to `dependencies` in `Package.swift`:
+For the Apple adapter and the features below, use version 0.2.0 or later. In Xcode, choose **File → Add Package Dependencies**, enter the repository URL, and select the **AdaptiveModelRouting** library. In a Swift package, add this dependency to `Package.swift`:
+
+```swift
+.package(url: "https://github.com/coryparrry/AdaptiveModelRouting.git", .upToNextMinor(from: "0.2.0"))
+```
+
+Until version 0.2.0 is published, place a checkout beside your app’s package and use a local dependency:
 
 ```swift
 .package(path: "../AdaptiveModelRouting")
 ```
 
-Add `.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")` to your target’s dependencies. In an Xcode app project, you can add the checkout as a local package and select the same product for your app target.
+Add `.product(name: "AdaptiveModelRouting", package: "AdaptiveModelRouting")` to your target’s dependencies.
 
 ## Quick start: generate on device
 

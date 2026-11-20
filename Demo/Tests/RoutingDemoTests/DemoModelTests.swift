@@ -10,7 +10,12 @@ final class DemoModelTests: XCTestCase {
     /// Allocates a sample model whose optional persisted state is isolated from real app support data.
     private func model() -> (DemoModel, URL) {
         let root = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        return (DemoModel(cacheRoot: root), root)
+        return (fixtureModel(cacheRoot: root), root)
+    }
+
+    /// Supplies a separate simulated owner for Apple mode, including when reopening saved state.
+    private func fixtureModel(cacheRoot: URL) -> DemoModel {
+        DemoModel(cacheRoot: cacheRoot, makeAppleOwner: DemoRoutingOwner.fixture)
     }
 
     /// Fresh sample launches default to local-only simulated requests with disk persistence off.
@@ -28,6 +33,19 @@ final class DemoModelTests: XCTestCase {
         XCTAssertEqual(model.attempts.count, 1)
         XCTAssertEqual(model.sampleCount, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    /// Apple mode can complete a fixture request without initializing the Apple model service.
+    func testAppleModeUsesInjectedProvider() async {
+        let (model, root) = model()
+        defer { try? FileManager.default.removeItem(at: root) }
+        model.mode = .apple
+        model.policy = .cloud
+        model.start()
+        await model.waitUntilFinished()
+        XCTAssertEqual(model.status, "Completed in cloud")
+        XCTAssertTrue(model.output.contains("Simulated cloud reply"))
+        XCTAssertEqual(model.attempts.map(\.route), ["Cloud"])
     }
 
     /// The sample displays fallback only when the cloud failed before producing output.
@@ -133,14 +151,14 @@ final class DemoModelTests: XCTestCase {
         await first.waitUntilFinished()
         first.setPersistence(true)
         XCTAssertEqual(first.sampleCount, 1)
-        let reopened = DemoModel(cacheRoot: root)
+        let reopened = fixtureModel(cacheRoot: root)
         XCTAssertTrue(reopened.persistCalibration)
         reopened.start()
         await reopened.waitUntilFinished()
         XCTAssertEqual(reopened.sampleCount, 2)
         XCTAssertEqual(reopened.storageLabel, "Saved")
         reopened.setPersistence(false)
-        XCTAssertFalse(DemoModel(cacheRoot: root).persistCalibration)
+        XCTAssertFalse(fixtureModel(cacheRoot: root).persistCalibration)
     }
 
     /// Storage remains opt-in for each mode across switches and launches; disabling one preserves the other.
@@ -155,7 +173,7 @@ final class DemoModelTests: XCTestCase {
         XCTAssertNil(first.errorMessage)
         first.mode = .simulated
         first.setPersistence(false)
-        let reopened = DemoModel(cacheRoot: root)
+        let reopened = fixtureModel(cacheRoot: root)
         XCTAssertFalse(reopened.persistCalibration)
         reopened.mode = .apple
         XCTAssertTrue(reopened.persistCalibration)
@@ -171,7 +189,7 @@ final class DemoModelTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data(#"{"enabled":true}"#.utf8).write(to: root.appendingPathComponent("storage-preference.json"))
-        let reopened = DemoModel(cacheRoot: root)
+        let reopened = fixtureModel(cacheRoot: root)
         XCTAssertFalse(reopened.persistCalibration)
         reopened.mode = .apple
         XCTAssertFalse(reopened.persistCalibration)
