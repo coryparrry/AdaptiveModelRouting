@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/coryparrry/AdaptiveModelRouting/compare/v0.2.0...v0.3.0) (2026-11-20)
+
+
+### Features
+
+* **telemetry:** add opt-in aggregate usage reporting ([#9](https://github.com/coryparrry/AdaptiveModelRouting/issues/9)) ([3c403d4](https://github.com/coryparrry/AdaptiveModelRouting/commit/3c403d4d656b8a3c837c607c93601e55bb468fac))
+
+
+### Bug Fixes
+
+* **telemetry:** preserve reporting after consent is restored ([#11](https://github.com/coryparrry/AdaptiveModelRouting/issues/11)) ([265a475](https://github.com/coryparrry/AdaptiveModelRouting/commit/265a475a74d1e0ff635d048a4b86a9ad64da3c35))
+
 ## [0.2.0](https://github.com/coryparrry/AdaptiveModelRouting/compare/v0.1.0...v0.2.0) (2026-11-20)
 
 
