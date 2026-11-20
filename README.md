@@ -131,6 +131,8 @@ The default disk cache now uses a per-app directory, so apps using the old defau
 
 Run `python3 scripts/validate.py` for the Debug and Release tests, external consumer build, demo tests, iOS cross-build, and documentation checks. The automated suite uses injected providers. For dated results from the separate native macOS check and the remaining device and PCC checks, see the qualification record. [Validation and sample app](Sources/AdaptiveModelRouting/AdaptiveModelRouting.docc/ValidationAndSample.md) · [Contributing](CONTRIBUTING.md)
 
+For opt-in reporting from a consuming app, see [Package usage reporting](Telemetry/README.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

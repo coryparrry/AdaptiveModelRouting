@@ -1,0 +1,12 @@
+{
+  "name": "adaptive-model-routing-usage",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check:bundle": "wrangler deploy --dry-run --outdir .wrangler/bundle"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}
