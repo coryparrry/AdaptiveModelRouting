@@ -1,0 +1,116 @@
+name: Stage or publish Swift package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable version on the draft, such as v0.2.0
+        required: true
+        type: string
+      source_sha:
+        description: Full commit SHA of the merged release PR
+        required: true
+        type: string
+      publish:
+        description: Publish after staging succeeds (requires a public repository)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-package-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_SHA: ${{ inputs.source_sha }}
+
+jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # GitHub requires push access to list drafts.
+      pull-requests: read
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      draft: ${{ steps.draft.outputs.draft }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          args=()
+          if [[ "$PUBLISH" == 'true' ]]; then args+=(--publish); fi
+          python3 scripts/release.py resolve "$RELEASE_TAG" "$RELEASE_SHA" "${args[@]}"
+
+  stage:
+    needs: resolve
+    if: needs.resolve.outputs.draft == 'true'
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Validate the staged source without native inference
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          python3 scripts/validate.py
+      - name: Resolve and build the proposed SwiftPM version
+        run: python3 scripts/release.py smoke "$RELEASE_TAG" "$RELEASE_SHA"
+      - name: Upload staging evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-validation
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            .build/validation/*.log
+            .build/validation/summary.json
+            .build/validation/AdaptiveModelRouting.doccarchive.zip
+
+  publish:
+    needs: [resolve, stage]
+    if: inputs.publish && needs.resolve.outputs.draft == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.resolve.outputs.release_id }}
+        run: python3 scripts/release.py publish "$RELEASE_TAG" "$RELEASE_SHA" "$RELEASE_ID"
+
+  verify:
+    needs: [resolve, stage, publish]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.resolve.outputs.draft == 'false' || needs.publish.result == 'success') }}
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Resolve and build from GitHub without credentials
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          python3 scripts/release.py smoke "$RELEASE_TAG" "$RELEASE_SHA" --published
